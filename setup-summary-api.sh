@@ -3,15 +3,17 @@ set -euo pipefail
 
 APP_DIR="${APP_DIR:-/root/tunnel-sync}"
 APP_NAME="${APP_NAME:-tunnel-summary}"
-PORT="${SUMMARY_PORT:-8789}"
-DB_PATH="${POTATO_DB:-/usr/sbin/potatonc/potato.db}"
+SUMMARY_PORT="${SUMMARY_PORT:-8789}"
+POTATO_DB="${POTATO_DB:-/usr/sbin/potatonc/potato.db}"
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "Please run as root (or sudo)."
+  echo "Please run as root (or use sudo)."
   exit 1
 fi
 
-log() { echo "[setup-summary-api] $*"; }
+log() {
+  echo "[setup-summary-api] $*"
+}
 
 install_node_if_missing() {
   if command -v node >/dev/null 2>&1; then
@@ -21,7 +23,7 @@ install_node_if_missing() {
 
   log "Installing Node.js 20.x..."
   apt-get update -y
-  apt-get install -y curl ca-certificates gnupg
+  apt-get install -y curl ca-certificates gnupg apt-transport-https
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
   log "Node.js installed: $(node -v)"
@@ -79,32 +81,36 @@ app.get('/internal/account-summary', (req, res) => {
   }
 
   const db = new sqlite3.Database(DB);
-  db.get(`
+  db.get(
+    `
     SELECT
       (SELECT COUNT(*) FROM account_sshs    WHERE UPPER(TRIM(status))='AKTIF') AS ssh,
       (SELECT COUNT(*) FROM account_vmesses WHERE UPPER(TRIM(status))='AKTIF') AS vmess,
       (SELECT COUNT(*) FROM account_vlesses WHERE UPPER(TRIM(status))='AKTIF') AS vless,
       (SELECT COUNT(*) FROM account_trojans WHERE UPPER(TRIM(status))='AKTIF') AS trojan
-  `, (err, row) => {
-    db.close();
-    if (err) {
-      return res.status(500).json({ ok: false, message: err.message });
+    `,
+    (err, row) => {
+      db.close();
+
+      if (err) {
+        return res.status(500).json({ ok: false, message: err.message });
+      }
+
+      const ssh = Number(row?.ssh || 0);
+      const vmess = Number(row?.vmess || 0);
+      const vless = Number(row?.vless || 0);
+      const trojan = Number(row?.trojan || 0);
+
+      return res.json({
+        ok: true,
+        ssh,
+        vmess,
+        vless,
+        trojan,
+        total: ssh + vmess + vless + trojan
+      });
     }
-
-    const ssh = Number(row?.ssh || 0);
-    const vmess = Number(row?.vmess || 0);
-    const vless = Number(row?.vless || 0);
-    const trojan = Number(row?.trojan || 0);
-
-    return res.json({
-      ok: true,
-      ssh,
-      vmess,
-      vless,
-      trojan,
-      total: ssh + vmess + vless + trojan
-    });
-  });
+  );
 });
 
 app.listen(PORT, () => {
@@ -113,9 +119,9 @@ app.listen(PORT, () => {
 JS
 
   cat > "${APP_DIR}/.env" <<EOF
-SUMMARY_PORT=${PORT}
+SUMMARY_PORT=${SUMMARY_PORT}
 SYNC_TOKEN=${SYNC_TOKEN}
-POTATO_DB=${DB_PATH}
+POTATO_DB=${POTATO_DB}
 EOF
 
   chmod 600 "${APP_DIR}/.env"
@@ -131,13 +137,15 @@ install_dependencies() {
 
 start_pm2_service() {
   cd "${APP_DIR}"
+
   pm2 delete "${APP_NAME}" >/dev/null 2>&1 || true
   pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}"
   pm2 save --force
 
   pm2 startup systemd -u root --hp /root >/tmp/pm2-startup.out 2>&1 || true
-  if grep -q "sudo" /tmp/pm2-startup.out; then
-    bash -lc "$(grep -Eo 'sudo .+' /tmp/pm2-startup.out | head -n1 | sed 's/^sudo //')" || true
+  STARTUP_CMD="$(grep -Eo 'sudo .+' /tmp/pm2-startup.out | head -n1 || true)"
+  if [[ -n "${STARTUP_CMD}" ]]; then
+    bash -lc "${STARTUP_CMD#sudo }" || true
   fi
 
   systemctl enable pm2-root >/dev/null 2>&1 || true
@@ -149,14 +157,14 @@ print_result() {
   echo
   echo "Service Name : ${APP_NAME}"
   echo "Service Path : ${APP_DIR}/summary-api.js"
-  echo "Port         : ${PORT}"
-  echo "DB Path      : ${DB_PATH}"
+  echo "Port         : ${SUMMARY_PORT}"
+  echo "DB Path      : ${POTATO_DB}"
   echo
   echo "Health check:"
-  echo "  curl -s http://127.0.0.1:${PORT}/health && echo"
+  echo "  curl -s http://127.0.0.1:${SUMMARY_PORT}/health && echo"
   echo
   echo "Summary check:"
-  echo "  curl -s -H \"x-sync-token: ${SYNC_TOKEN}\" http://127.0.0.1:${PORT}/internal/account-summary && echo"
+  echo "  curl -s -H \"x-sync-token: ${SYNC_TOKEN}\" http://127.0.0.1:${SUMMARY_PORT}/internal/account-summary && echo"
 }
 
 install_node_if_missing
