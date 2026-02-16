@@ -40,19 +40,6 @@ install_pm2_if_missing() {
   log "PM2 installed: $(pm2 -v)"
 }
 
-ask_sync_token() {
-  if [[ -n "${SYNC_TOKEN:-}" ]]; then
-    return
-  fi
-
-  read -r -s -p "Input SYNC_TOKEN for API auth: " SYNC_TOKEN
-  echo
-  if [[ -z "${SYNC_TOKEN}" ]]; then
-    echo "SYNC_TOKEN cannot be empty."
-    exit 1
-  fi
-}
-
 write_files() {
   mkdir -p "${APP_DIR}"
 
@@ -63,24 +50,16 @@ require('dotenv').config();
 
 const app = express();
 const PORT = Number(process.env.SUMMARY_PORT || 8789);
-const TOKEN = process.env.SYNC_TOKEN || '';
 const DB = process.env.POTATO_DB || '/usr/sbin/potatonc/potato.db';
+const USE_DB_AUTH = String(process.env.USE_DB_AUTH || '1') !== '0';
+const STATIC_TOKEN = (process.env.SYNC_TOKEN || '').trim();
 
-if (!TOKEN) {
-  console.error('SYNC_TOKEN is empty. Fill .env first.');
+if (!USE_DB_AUTH && !STATIC_TOKEN) {
+  console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
   process.exit(1);
 }
 
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'tunnel-summary' });
-});
-
-app.get('/internal/account-summary', (req, res) => {
-  if (req.headers['x-sync-token'] !== TOKEN) {
-    return res.status(401).json({ ok: false, message: 'unauthorized' });
-  }
-
-  const db = new sqlite3.Database(DB);
+function sendSummary(db, res) {
   db.get(
     `
     SELECT
@@ -91,7 +70,6 @@ app.get('/internal/account-summary', (req, res) => {
     `,
     (err, row) => {
       db.close();
-
       if (err) {
         return res.status(500).json({ ok: false, message: err.message });
       }
@@ -111,6 +89,43 @@ app.get('/internal/account-summary', (req, res) => {
       });
     }
   );
+}
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, service: 'tunnel-summary', useDbAuth: USE_DB_AUTH });
+});
+
+app.get('/internal/account-summary', (req, res) => {
+  const incomingToken = String(req.headers['x-sync-token'] || '').trim();
+  if (!incomingToken) {
+    return res.status(401).json({ ok: false, message: 'unauthorized' });
+  }
+
+  const db = new sqlite3.Database(DB);
+
+  if (USE_DB_AUTH) {
+    db.get('SELECT COUNT(*) AS c FROM servers WHERE auth = ?', [incomingToken], (authErr, authRow) => {
+      if (authErr) {
+        db.close();
+        return res.status(500).json({ ok: false, message: authErr.message });
+      }
+
+      if (!authRow || Number(authRow.c || 0) < 1) {
+        db.close();
+        return res.status(401).json({ ok: false, message: 'unauthorized' });
+      }
+
+      return sendSummary(db, res);
+    });
+    return;
+  }
+
+  if (incomingToken !== STATIC_TOKEN) {
+    db.close();
+    return res.status(401).json({ ok: false, message: 'unauthorized' });
+  }
+
+  return sendSummary(db, res);
 });
 
 app.listen(PORT, () => {
@@ -120,8 +135,9 @@ JS
 
   cat > "${APP_DIR}/.env" <<EOF
 SUMMARY_PORT=${SUMMARY_PORT}
-SYNC_TOKEN=${SYNC_TOKEN}
 POTATO_DB=${POTATO_DB}
+USE_DB_AUTH=1
+SYNC_TOKEN=
 EOF
 
   chmod 600 "${APP_DIR}/.env"
@@ -159,17 +175,17 @@ print_result() {
   echo "Service Path : ${APP_DIR}/summary-api.js"
   echo "Port         : ${SUMMARY_PORT}"
   echo "DB Path      : ${POTATO_DB}"
+  echo "Auth Mode    : DB (servers.auth)"
   echo
   echo "Health check:"
   echo "  curl -s http://127.0.0.1:${SUMMARY_PORT}/health && echo"
   echo
-  echo "Summary check:"
-  echo "  curl -s -H \"x-sync-token: ${SYNC_TOKEN}\" http://127.0.0.1:${SUMMARY_PORT}/internal/account-summary && echo"
+  echo "Summary check (token harus ada di potato.db tabel servers kolom auth):"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_AUTH\" http://127.0.0.1:${SUMMARY_PORT}/internal/account-summary && echo"
 }
 
 install_node_if_missing
 install_pm2_if_missing
-ask_sync_token
 write_files
 install_dependencies
 start_pm2_service
