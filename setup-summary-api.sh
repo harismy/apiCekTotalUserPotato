@@ -104,7 +104,7 @@ app.get('/internal/account-summary', (req, res) => {
   const db = new sqlite3.Database(DB);
 
   if (USE_DB_AUTH) {
-    db.get('SELECT COUNT(*) AS c FROM servers WHERE auth = ?', [incomingToken], (authErr, authRow) => {
+    db.get('SELECT COUNT(*) AS c FROM servers WHERE "key" = ?', [incomingToken], (authErr, authRow) => {
       if (authErr) {
         db.close();
         return res.status(500).json({ ok: false, message: authErr.message });
@@ -175,13 +175,13 @@ print_result() {
   echo "Service Path : ${APP_DIR}/summary-api.js"
   echo "Port         : ${SUMMARY_PORT}"
   echo "DB Path      : ${POTATO_DB}"
-  echo "Auth Mode    : DB (servers.auth)"
+  echo "Auth Mode    : DB (servers.key)"
   echo
   echo "Health check:"
   echo "  curl -s http://127.0.0.1:${SUMMARY_PORT}/health && echo"
   echo
   echo "Summary check (token harus ada di potato.db tabel servers kolom auth):"
-  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_AUTH\" http://127.0.0.1:${SUMMARY_PORT}/internal/account-summary && echo"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" http://127.0.0.1:${SUMMARY_PORT}/internal/account-summary && echo"
 }
 
 install_node_if_missing
@@ -190,3 +190,4 @@ write_files
 install_dependencies
 start_pm2_service
 print_result
+
