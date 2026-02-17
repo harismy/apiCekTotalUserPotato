@@ -21,7 +21,7 @@ bash /tmp/setup-summary-api.sh
 
 ### Cara Pakai di Bot (setelah API tunnel terpasang)
 1. Pastikan di database bot, setiap server sudah punya `domain` atau `sync_host` yang mengarah ke VPS tunnel(vps yang udah dipasang SC potato).
-2. Pastikan token di bot (`Server.auth`) sama dengan token yang tervalidasi di VPS tunnel (`servers.key`).
+2. Pastikan token (api key potato) di bot sama dengan token yang tervalidasi di VPS tunnel (`servers.key`).
 3. Trigger sinkron manual dari admin:
    - Command: `/syncservernow`
    - Tombol admin: `Sync Server Sekarang`
@@ -85,3 +85,4 @@ Contoh response (tidak ketemu):
 - `401 unauthorized`: token salah / tidak ada / tidak terdaftar di DB tunnel
 - `400 username required`: query `username` belum dikirim pada endpoint expiry
 - `500`: error internal API atau akses DB
+
