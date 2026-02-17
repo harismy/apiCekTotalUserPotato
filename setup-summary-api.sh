@@ -90,6 +90,49 @@ function sendSummary(db, res) {
     }
   );
 }
+function sendAccountExpiry(db, res, username) {
+  db.get(
+    `
+    SELECT service, date_exp FROM (
+      SELECT 'ssh' AS service, date_exp FROM account_sshs
+       WHERE LOWER(username) = LOWER(?) AND UPPER(TRIM(status)) = 'AKTIF'
+      UNION ALL
+      SELECT 'vmess' AS service, date_exp FROM account_vmesses
+       WHERE LOWER(username) = LOWER(?) AND UPPER(TRIM(status)) = 'AKTIF'
+      UNION ALL
+      SELECT 'vless' AS service, date_exp FROM account_vlesses
+       WHERE LOWER(username) = LOWER(?) AND UPPER(TRIM(status)) = 'AKTIF'
+      UNION ALL
+      SELECT 'trojan' AS service, date_exp FROM account_trojans
+       WHERE LOWER(username) = LOWER(?) AND UPPER(TRIM(status)) = 'AKTIF'
+      UNION ALL
+      SELECT 'udp_http' AS service, date_exp FROM account_sshs
+       WHERE LOWER(username) = LOWER(?) AND UPPER(TRIM(status)) = 'AKTIF'
+      UNION ALL
+      SELECT 'zivpn' AS service, date_exp FROM account_sshs
+       WHERE LOWER(username) = LOWER(?) AND UPPER(TRIM(status)) = 'AKTIF'
+    ) q
+    ORDER BY date(date_exp) DESC
+    LIMIT 1
+    `,
+    [username, username, username, username, username, username],
+    (err, row) => {
+      db.close();
+      if (err) {
+        return res.status(500).json({ ok: false, message: err.message });
+      }
+      if (!row) {
+        return res.json({ ok: true, found: false });
+      }
+      return res.json({
+        ok: true,
+        found: true,
+        service: String(row.service || '').toLowerCase(),
+        date_exp: String(row.date_exp || '').trim()
+      });
+    }
+  );
+}
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'tunnel-summary', useDbAuth: USE_DB_AUTH });
@@ -128,7 +171,44 @@ app.get('/internal/account-summary', (req, res) => {
   return sendSummary(db, res);
 });
 
-app.listen(PORT, () => {
+
+app.get('/internal/account-expiry', (req, res) => {
+  const incomingToken = String(req.headers['x-sync-token'] || '').trim();
+  const username = String(req.query.username || '').trim();
+
+  if (!incomingToken) {
+    return res.status(401).json({ ok: false, message: 'unauthorized' });
+  }
+  if (!username) {
+    return res.status(400).json({ ok: false, message: 'username required' });
+  }
+
+  const db = new sqlite3.Database(DB);
+
+  if (USE_DB_AUTH) {
+    db.get('SELECT COUNT(*) AS c FROM servers WHERE "key" = ?', [incomingToken], (authErr, authRow) => {
+      if (authErr) {
+        db.close();
+        return res.status(500).json({ ok: false, message: authErr.message });
+      }
+
+      if (!authRow || Number(authRow.c || 0) < 1) {
+        db.close();
+        return res.status(401).json({ ok: false, message: 'unauthorized' });
+      }
+
+      return sendAccountExpiry(db, res, username);
+    });
+    return;
+  }
+
+  if (incomingToken !== STATIC_TOKEN) {
+    db.close();
+    return res.status(401).json({ ok: false, message: 'unauthorized' });
+  }
+
+  return sendAccountExpiry(db, res, username);
+});app.listen(PORT, () => {
   console.log(`summary api on port ${PORT}`);
 });
 JS
@@ -190,4 +270,5 @@ write_files
 install_dependencies
 start_pm2_service
 print_result
+
 
