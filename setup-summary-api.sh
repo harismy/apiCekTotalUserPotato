@@ -70,9 +70,7 @@ function sendSummary(db, res) {
     `,
     (err, row) => {
       db.close();
-      if (err) {
-        return res.status(500).json({ ok: false, message: err.message });
-      }
+      if (err) return res.status(500).json({ ok: false, message: err.message });
 
       const ssh = Number(row?.ssh || 0);
       const vmess = Number(row?.vmess || 0);
@@ -90,6 +88,7 @@ function sendSummary(db, res) {
     }
   );
 }
+
 function sendAccountExpiry(db, res, username) {
   db.get(
     `
@@ -118,12 +117,9 @@ function sendAccountExpiry(db, res, username) {
     [username, username, username, username, username, username],
     (err, row) => {
       db.close();
-      if (err) {
-        return res.status(500).json({ ok: false, message: err.message });
-      }
-      if (!row) {
-        return res.json({ ok: true, found: false });
-      }
+      if (err) return res.status(500).json({ ok: false, message: err.message });
+      if (!row) return res.json({ ok: true, found: false });
+
       return res.json({
         ok: true,
         found: true,
@@ -134,81 +130,95 @@ function sendAccountExpiry(db, res, username) {
   );
 }
 
+function sendExpirySummary(db, res, dateYmd) {
+  db.get(
+    `
+    SELECT
+      (SELECT COUNT(*) FROM account_sshs    WHERE date(date_exp)=date(?) ) AS ssh,
+      (SELECT COUNT(*) FROM account_vmesses WHERE date(date_exp)=date(?) ) AS vmess,
+      (SELECT COUNT(*) FROM account_vlesses WHERE date(date_exp)=date(?) ) AS vless,
+      (SELECT COUNT(*) FROM account_trojans WHERE date(date_exp)=date(?) ) AS trojan
+    `,
+    [dateYmd, dateYmd, dateYmd, dateYmd],
+    (err, row) => {
+      db.close();
+      if (err) return res.status(500).json({ ok: false, message: err.message });
+
+      const ssh = Number(row?.ssh || 0);
+      const vmess = Number(row?.vmess || 0);
+      const vless = Number(row?.vless || 0);
+      const trojan = Number(row?.trojan || 0);
+      const totalExpired = ssh + vmess + vless + trojan;
+
+      return res.json({
+        ok: true,
+        date: dateYmd,
+        ssh,
+        vmess,
+        vless,
+        trojan,
+        total_expired: totalExpired
+      });
+    }
+  );
+}
+
+function authorizeAndRun(req, res, runHandler) {
+  const incomingToken = String(req.headers['x-sync-token'] || '').trim();
+  if (!incomingToken) {
+    return res.status(401).json({ ok: false, message: 'unauthorized' });
+  }
+
+  const db = new sqlite3.Database(DB);
+
+  if (USE_DB_AUTH) {
+    db.get('SELECT COUNT(*) AS c FROM servers WHERE "key" = ?', [incomingToken], (authErr, authRow) => {
+      if (authErr) {
+        db.close();
+        return res.status(500).json({ ok: false, message: authErr.message });
+      }
+      if (!authRow || Number(authRow.c || 0) < 1) {
+        db.close();
+        return res.status(401).json({ ok: false, message: 'unauthorized' });
+      }
+      return runHandler(db);
+    });
+    return;
+  }
+
+  if (incomingToken !== STATIC_TOKEN) {
+    db.close();
+    return res.status(401).json({ ok: false, message: 'unauthorized' });
+  }
+
+  return runHandler(db);
+}
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'tunnel-summary', useDbAuth: USE_DB_AUTH });
 });
 
 app.get('/internal/account-summary', (req, res) => {
-  const incomingToken = String(req.headers['x-sync-token'] || '').trim();
-  if (!incomingToken) {
-    return res.status(401).json({ ok: false, message: 'unauthorized' });
-  }
-
-  const db = new sqlite3.Database(DB);
-
-  if (USE_DB_AUTH) {
-    db.get('SELECT COUNT(*) AS c FROM servers WHERE "key" = ?', [incomingToken], (authErr, authRow) => {
-      if (authErr) {
-        db.close();
-        return res.status(500).json({ ok: false, message: authErr.message });
-      }
-
-      if (!authRow || Number(authRow.c || 0) < 1) {
-        db.close();
-        return res.status(401).json({ ok: false, message: 'unauthorized' });
-      }
-
-      return sendSummary(db, res);
-    });
-    return;
-  }
-
-  if (incomingToken !== STATIC_TOKEN) {
-    db.close();
-    return res.status(401).json({ ok: false, message: 'unauthorized' });
-  }
-
-  return sendSummary(db, res);
+  return authorizeAndRun(req, res, (db) => sendSummary(db, res));
 });
 
-
 app.get('/internal/account-expiry', (req, res) => {
-  const incomingToken = String(req.headers['x-sync-token'] || '').trim();
   const username = String(req.query.username || '').trim();
-
-  if (!incomingToken) {
-    return res.status(401).json({ ok: false, message: 'unauthorized' });
-  }
   if (!username) {
     return res.status(400).json({ ok: false, message: 'username required' });
   }
+  return authorizeAndRun(req, res, (db) => sendAccountExpiry(db, res, username));
+});
 
-  const db = new sqlite3.Database(DB);
-
-  if (USE_DB_AUTH) {
-    db.get('SELECT COUNT(*) AS c FROM servers WHERE "key" = ?', [incomingToken], (authErr, authRow) => {
-      if (authErr) {
-        db.close();
-        return res.status(500).json({ ok: false, message: authErr.message });
-      }
-
-      if (!authRow || Number(authRow.c || 0) < 1) {
-        db.close();
-        return res.status(401).json({ ok: false, message: 'unauthorized' });
-      }
-
-      return sendAccountExpiry(db, res, username);
-    });
-    return;
+app.get('/internal/expiry-summary', (req, res) => {
+  const dateYmd = String(req.query.date || '').trim() || new Date().toISOString().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateYmd)) {
+    return res.status(400).json({ ok: false, message: 'date must be YYYY-MM-DD' });
   }
+  return authorizeAndRun(req, res, (db) => sendExpirySummary(db, res, dateYmd));
+});
 
-  if (incomingToken !== STATIC_TOKEN) {
-    db.close();
-    return res.status(401).json({ ok: false, message: 'unauthorized' });
-  }
-
-  return sendAccountExpiry(db, res, username);
-});app.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`summary api on port ${PORT}`);
 });
 JS
@@ -260,8 +270,11 @@ print_result() {
   echo "Health check:"
   echo "  curl -s http://127.0.0.1:${SUMMARY_PORT}/health && echo"
   echo
-  echo "Summary check (token harus ada di potato.db tabel servers kolom auth):"
+  echo "Summary check (token harus ada di potato.db tabel servers kolom key):"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" http://127.0.0.1:${SUMMARY_PORT}/internal/account-summary && echo"
+  echo
+  echo "Expiry summary check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" \"http://127.0.0.1:${SUMMARY_PORT}/internal/expiry-summary?date=$(date +%F)\" && echo"
 }
 
 install_node_if_missing
@@ -270,5 +283,3 @@ write_files
 install_dependencies
 start_pm2_service
 print_result
-
-
