@@ -182,10 +182,22 @@ function bytesToGb(bytes) {
   return Number(bytes || 0) / (1024 * 1024 * 1024);
 }
 
-function safeDateFromId(idObj) {
-  const y = Number(idObj?.year || 0);
-  const m = Number(idObj?.month || 0);
-  const d = Number(idObj?.day || 0);
+function getEntryDateParts(entry) {
+  const idObj = (entry && typeof entry.id === 'object' && entry.id !== null) ? entry.id : null;
+  const dateObj = (entry && typeof entry.date === 'object' && entry.date !== null) ? entry.date : null;
+  const src = idObj || dateObj || {};
+  return {
+    year: Number(src?.year || 0),
+    month: Number(src?.month || 0),
+    day: Number(src?.day || 0)
+  };
+}
+
+function safeDateFromEntry(entry) {
+  const parts = getEntryDateParts(entry);
+  const y = Number(parts.year || 0);
+  const m = Number(parts.month || 0);
+  const d = Number(parts.day || 0);
   if (!y || !m || !d) return 0;
   return new Date(y, m - 1, d).getTime();
 }
@@ -194,8 +206,22 @@ function pickLatestDayEntry(dayEntries) {
   if (!Array.isArray(dayEntries) || dayEntries.length === 0) return null;
   return dayEntries.reduce((latest, item) => {
     if (!latest) return item;
-    return safeDateFromId(item.id) > safeDateFromId(latest.id) ? item : latest;
+    return safeDateFromEntry(item) > safeDateFromEntry(latest) ? item : latest;
   }, null);
+}
+
+function pickDayEntryForToday(dayEntries) {
+  if (!Array.isArray(dayEntries) || dayEntries.length === 0) return null;
+  const now = new Date();
+  const yy = now.getFullYear();
+  const mm = now.getMonth() + 1;
+  const dd = now.getDate();
+  const today = dayEntries.find((entry) => {
+    const p = getEntryDateParts(entry);
+    return Number(p.year) === yy && Number(p.month) === mm && Number(p.day) === dd;
+  });
+  if (today) return today;
+  return pickLatestDayEntry(dayEntries);
 }
 
 function pickCurrentMonthEntry(monthEntries) {
@@ -203,7 +229,12 @@ function pickCurrentMonthEntry(monthEntries) {
   const now = new Date();
   const year = now.getFullYear();
   const month = now.getMonth() + 1;
-  const exact = monthEntries.find((m) => Number(m?.id?.year) === year && Number(m?.id?.month) === month);
+  const exact = monthEntries.find((m) => {
+    const idObj = (m && typeof m.id === 'object' && m.id !== null) ? m.id : null;
+    const dateObj = (m && typeof m.date === 'object' && m.date !== null) ? m.date : null;
+    const src = idObj || dateObj || {};
+    return Number(src?.year) === year && Number(src?.month) === month;
+  });
   if (exact) return exact;
   return monthEntries[monthEntries.length - 1] || null;
 }
@@ -230,20 +261,25 @@ function sendVnstatDaily(res) {
     let totalTxBytes = 0;
     let totalMonthBytes = 0;
     let latestDate = '';
+    let latestDateTs = 0;
 
     for (const iface of interfaces) {
       const name = String(iface?.name || '').toLowerCase();
       if (name === 'lo' || name.startsWith('ifb')) continue;
 
-      const dayEntry = pickLatestDayEntry(iface?.traffic?.day || []);
+      const dayEntry = pickDayEntryForToday(iface?.traffic?.day || []);
       if (dayEntry) {
         totalRxBytes += Number(dayEntry.rx || 0);
         totalTxBytes += Number(dayEntry.tx || 0);
-        const d = dayEntry.id || {};
-        const y = String(d.year || '').padStart(4, '0');
-        const m = String(d.month || '').padStart(2, '0');
-        const day = String(d.day || '').padStart(2, '0');
-        if (y && m && day) latestDate = `${y}-${m}-${day}`;
+        const d = getEntryDateParts(dayEntry);
+        const ts = safeDateFromEntry(dayEntry);
+        if (ts > 0 && ts >= latestDateTs && d.year > 0 && d.month > 0 && d.day > 0) {
+          const y = String(d.year).padStart(4, '0');
+          const m = String(d.month).padStart(2, '0');
+          const day = String(d.day).padStart(2, '0');
+          latestDateTs = ts;
+          latestDate = `${y}-${m}-${day}`;
+        }
       }
 
       const monthEntry = pickCurrentMonthEntry(iface?.traffic?.month || []);
