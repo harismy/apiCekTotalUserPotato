@@ -40,12 +40,27 @@ install_pm2_if_missing() {
   log "PM2 installed: $(pm2 -v)"
 }
 
+install_vnstat_if_missing() {
+  if command -v vnstat >/dev/null 2>&1; then
+    log "vnstat already installed: $(vnstat --version | head -n1)"
+    return
+  fi
+
+  log "Installing vnstat..."
+  apt-get update -y
+  apt-get install -y vnstat
+  systemctl enable vnstat >/dev/null 2>&1 || true
+  systemctl restart vnstat >/dev/null 2>&1 || true
+  log "vnstat installed"
+}
+
 write_files() {
   mkdir -p "${APP_DIR}"
 
   cat > "${APP_DIR}/summary-api.js" <<'JS'
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
+const { execFile } = require('child_process');
 require('dotenv').config();
 
 const app = express();
@@ -163,6 +178,98 @@ function sendExpirySummary(db, res, dateYmd) {
   );
 }
 
+function bytesToGb(bytes) {
+  return Number(bytes || 0) / (1024 * 1024 * 1024);
+}
+
+function safeDateFromId(idObj) {
+  const y = Number(idObj?.year || 0);
+  const m = Number(idObj?.month || 0);
+  const d = Number(idObj?.day || 0);
+  if (!y || !m || !d) return 0;
+  return new Date(y, m - 1, d).getTime();
+}
+
+function pickLatestDayEntry(dayEntries) {
+  if (!Array.isArray(dayEntries) || dayEntries.length === 0) return null;
+  return dayEntries.reduce((latest, item) => {
+    if (!latest) return item;
+    return safeDateFromId(item.id) > safeDateFromId(latest.id) ? item : latest;
+  }, null);
+}
+
+function pickCurrentMonthEntry(monthEntries) {
+  if (!Array.isArray(monthEntries) || monthEntries.length === 0) return null;
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth() + 1;
+  const exact = monthEntries.find((m) => Number(m?.id?.year) === year && Number(m?.id?.month) === month);
+  if (exact) return exact;
+  return monthEntries[monthEntries.length - 1] || null;
+}
+
+function sendVnstatDaily(res) {
+  execFile('vnstat', ['--json'], { timeout: 15000, maxBuffer: 1024 * 1024 * 4 }, (err, stdout) => {
+    if (err) {
+      return res.status(500).json({ ok: false, message: `vnstat exec gagal: ${err.message}` });
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(String(stdout || '{}'));
+    } catch (parseErr) {
+      return res.status(500).json({ ok: false, message: `vnstat json invalid: ${parseErr.message}` });
+    }
+
+    const interfaces = Array.isArray(parsed.interfaces) ? parsed.interfaces : [];
+    if (interfaces.length === 0) {
+      return res.status(500).json({ ok: false, message: 'tidak ada interface vnstat' });
+    }
+
+    let totalRxBytes = 0;
+    let totalTxBytes = 0;
+    let totalMonthBytes = 0;
+    let latestDate = '';
+
+    for (const iface of interfaces) {
+      const name = String(iface?.name || '').toLowerCase();
+      if (name === 'lo' || name.startsWith('ifb')) continue;
+
+      const dayEntry = pickLatestDayEntry(iface?.traffic?.day || []);
+      if (dayEntry) {
+        totalRxBytes += Number(dayEntry.rx || 0);
+        totalTxBytes += Number(dayEntry.tx || 0);
+        const d = dayEntry.id || {};
+        const y = String(d.year || '').padStart(4, '0');
+        const m = String(d.month || '').padStart(2, '0');
+        const day = String(d.day || '').padStart(2, '0');
+        if (y && m && day) latestDate = `${y}-${m}-${day}`;
+      }
+
+      const monthEntry = pickCurrentMonthEntry(iface?.traffic?.month || []);
+      if (monthEntry) {
+        totalMonthBytes += Number(monthEntry.rx || 0) + Number(monthEntry.tx || 0);
+      }
+    }
+
+    const totalBytes = totalRxBytes + totalTxBytes;
+    const rxGb = bytesToGb(totalRxBytes);
+    const txGb = bytesToGb(totalTxBytes);
+    const totalGb = bytesToGb(totalBytes);
+    const monthTotalGb = bytesToGb(totalMonthBytes);
+
+    return res.json({
+      ok: true,
+      date: latestDate || new Date().toISOString().slice(0, 10),
+      rx_gb: Number(rxGb.toFixed(3)),
+      tx_gb: Number(txGb.toFixed(3)),
+      total_gb: Number(totalGb.toFixed(3)),
+      month_total_gb: Number(monthTotalGb.toFixed(3)),
+      month_total_tb: Number((monthTotalGb / 1024).toFixed(4))
+    });
+  });
+}
+
 function authorizeAndRun(req, res, runHandler) {
   const incomingToken = String(req.headers['x-sync-token'] || '').trim();
   if (!incomingToken) {
@@ -216,6 +323,13 @@ app.get('/internal/expiry-summary', (req, res) => {
     return res.status(400).json({ ok: false, message: 'date must be YYYY-MM-DD' });
   }
   return authorizeAndRun(req, res, (db) => sendExpirySummary(db, res, dateYmd));
+});
+
+app.get('/internal/vnstat-daily', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    return sendVnstatDaily(res);
+  });
 });
 
 app.listen(PORT, () => {
@@ -275,10 +389,14 @@ print_result() {
   echo
   echo "Expiry summary check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" \"http://127.0.0.1:${SUMMARY_PORT}/internal/expiry-summary?date=$(date +%F)\" && echo"
+  echo
+  echo "Vnstat daily check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" \"http://127.0.0.1:${SUMMARY_PORT}/internal/vnstat-daily\" && echo"
 }
 
 install_node_if_missing
 install_pm2_if_missing
+install_vnstat_if_missing
 write_files
 install_dependencies
 start_pm2_service
