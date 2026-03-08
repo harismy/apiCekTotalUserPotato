@@ -60,10 +60,12 @@ write_files() {
   cat > "${APP_DIR}/summary-api.js" <<'JS'
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
-const { execFile } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
+const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
+app.use(express.json({ limit: '2mb' }));
 const PORT = Number(process.env.SUMMARY_PORT || 8789);
 const DB = process.env.POTATO_DB || '/usr/sbin/potatonc/potato.db';
 const USE_DB_AUTH = String(process.env.USE_DB_AUTH || '1') !== '0';
@@ -180,6 +182,106 @@ function sendExpirySummary(db, res, dateYmd) {
 
 function bytesToGb(bytes) {
   return Number(bytes || 0) / (1024 * 1024 * 1024);
+}
+
+function isSshLikeType(rawType) {
+  const type = String(rawType || '').trim().toLowerCase();
+  return type === 'ssh' || type === 'zivpn' || type === 'udp_http';
+}
+
+function isValidUnixUsername(username) {
+  return /^[a-z0-9][a-z0-9_-]{2,31}$/.test(String(username || '').trim());
+}
+
+function syncSshLinuxUsers(accounts) {
+  const rows = Array.isArray(accounts) ? accounts : [];
+  let created = 0;
+  let updated = 0;
+  let skipped = 0;
+  let failed = 0;
+  const errors = [];
+
+  for (const row of rows) {
+    const username = String(row?.username || '').trim();
+    if (!isValidUnixUsername(username)) {
+      skipped += 1;
+      continue;
+    }
+
+    const password = String(row?.password || username).trim() || username;
+    const dateExp = String(row?.date_exp || '').trim();
+    const homeDir = `/home/${username}`;
+
+    try {
+      let exists = true;
+      try {
+        execFileSync('id', ['-u', username], { stdio: 'ignore' });
+      } catch (_) {
+        exists = false;
+      }
+
+      if (!exists) {
+        execFileSync('useradd', ['-m', '-d', homeDir, '-s', '/bin/bash', username], { stdio: 'ignore' });
+        created += 1;
+      } else {
+        updated += 1;
+      }
+
+      try { fs.mkdirSync(homeDir, { recursive: true }); } catch (_) {}
+      execFileSync('chown', ['-R', `${username}:${username}`, homeDir], { stdio: 'ignore' });
+      execFileSync('usermod', ['-d', homeDir, '-s', '/bin/bash', username], { stdio: 'ignore' });
+      execFileSync('chpasswd', [], { input: `${username}:${password}\n` });
+
+      if (/^\d{4}-\d{2}-\d{2}$/.test(dateExp)) {
+        execFileSync('chage', ['-E', dateExp, username], { stdio: 'ignore' });
+      }
+    } catch (err) {
+      failed += 1;
+      errors.push(`${username}: ${err.message}`);
+    }
+  }
+
+  return {
+    ok: failed === 0,
+    created,
+    updated,
+    skipped,
+    failed,
+    errors
+  };
+}
+
+function deleteSshLinuxUsers(usernamesInput) {
+  const usernames = Array.isArray(usernamesInput)
+    ? usernamesInput.map((v) => String(v || '').trim()).filter(Boolean)
+    : [];
+
+  let deleted = 0;
+  let skipped = 0;
+  let failed = 0;
+  const errors = [];
+
+  for (const username of usernames) {
+    if (!isValidUnixUsername(username)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      try {
+        execFileSync('id', ['-u', username], { stdio: 'ignore' });
+      } catch (_) {
+        skipped += 1;
+        continue;
+      }
+      execFileSync('userdel', ['-r', username], { stdio: 'ignore' });
+      deleted += 1;
+    } catch (err) {
+      failed += 1;
+      errors.push(`${username}: ${err.message}`);
+    }
+  }
+
+  return { ok: failed === 0, deleted, skipped, failed, errors };
 }
 
 function getEntryDateParts(entry) {
@@ -306,6 +408,475 @@ function sendVnstatDaily(res) {
   });
 }
 
+function getAccountTableByType(rawType) {
+  const type = String(rawType || '').trim().toLowerCase();
+  if (type === 'ssh' || type === 'udp_http' || type === 'zivpn') return 'account_sshs';
+  if (type === 'vmess') return 'account_vmesses';
+  if (type === 'vless') return 'account_vlesses';
+  if (type === 'trojan') return 'account_trojans';
+  return '';
+}
+
+function detectZivpnUsersContainer(root) {
+  if (Array.isArray(root)) {
+    return { root, users: root, key: null, style: 'array_object' };
+  }
+  const obj = (root && typeof root === 'object') ? root : {};
+  if (obj.auth && typeof obj.auth === 'object' && Array.isArray(obj.auth.config)) {
+    return { root: obj, users: obj.auth.config, key: 'auth.config', style: 'auth_config' };
+  }
+  if (Array.isArray(obj.users)) return { root: obj, users: obj.users, key: 'users', style: 'array_object' };
+  if (Array.isArray(obj.accounts)) return { root: obj, users: obj.accounts, key: 'accounts', style: 'array_object' };
+  if (Array.isArray(obj.clients)) return { root: obj, users: obj.clients, key: 'clients', style: 'array_object' };
+  obj.users = [];
+  return { root: obj, users: obj.users, key: 'users', style: 'array_object' };
+}
+
+function mergeZivpnConfigFromSshAccounts(accounts) {
+  const cfgPath = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
+  let raw = '{}';
+  try {
+    if (fs.existsSync(cfgPath)) {
+      raw = fs.readFileSync(cfgPath, 'utf8');
+    }
+  } catch (readErr) {
+    return { ok: false, message: `gagal baca config zivpn: ${readErr.message}` };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (parseErr) {
+    return { ok: false, message: `config zivpn bukan JSON valid: ${parseErr.message}` };
+  }
+
+  const container = detectZivpnUsersContainer(parsed);
+  if (container.style === 'auth_config') {
+    // Pakai satu sumber kebenaran di auth.config (mode passwords).
+    delete container.root.users;
+    delete container.root.accounts;
+    delete container.root.clients;
+  }
+  const list = container.users;
+  const identity = (entry) => {
+    if (container.style === 'auth_config') return String(entry || '').trim().toLowerCase();
+    return String(entry?.username ?? entry?.user ?? entry?.name ?? entry?.password ?? '').trim().toLowerCase();
+  };
+  const existing = new Map();
+  for (let i = 0; i < list.length; i += 1) {
+    const id = identity(list[i]);
+    if (id) existing.set(id, i);
+  }
+
+  const sample = list.length > 0 && typeof list[0] === 'object' ? list[0] : null;
+  const passwordOnlyStyle = sample && ('password' in sample) && !('username' in sample) && !('user' in sample) && !('name' in sample);
+
+  let added = 0;
+  let updated = 0;
+
+  for (const row of accounts) {
+    const username = String(row?.username || '').trim();
+    if (!username) continue;
+    if (container.style === 'auth_config') {
+      const key = username.toLowerCase();
+      if (!existing.has(key)) {
+        list.push(username);
+        existing.set(key, list.length - 1);
+        added += 1;
+      } else {
+        const idx = existing.get(key);
+        if (Number.isInteger(idx)) list[idx] = username;
+        updated += 1;
+      }
+      continue;
+    }
+
+    const sshPass = String(row?.password || '').trim();
+    const key = username.toLowerCase();
+    const idx = existing.get(key);
+    if (idx === undefined) {
+      if (passwordOnlyStyle) {
+        list.push({ password: username });
+      } else {
+        list.push({ username, password: sshPass || username });
+      }
+      existing.set(key, list.length - 1);
+      added += 1;
+      continue;
+    }
+
+    const entry = list[idx];
+    if (entry && typeof entry === 'object') {
+      if (passwordOnlyStyle) {
+        entry.password = username;
+      } else {
+        if ('username' in entry || (!('user' in entry) && !('name' in entry))) entry.username = username;
+        if ('password' in entry || !('pass' in entry)) entry.password = sshPass || username;
+      }
+      updated += 1;
+    }
+  }
+
+  try {
+    fs.writeFileSync(cfgPath, JSON.stringify(container.root, null, 2));
+  } catch (writeErr) {
+    return { ok: false, message: `gagal tulis config zivpn: ${writeErr.message}` };
+  }
+
+  return { ok: true, path: cfgPath, added, updated };
+}
+
+function removeZivpnUsersByUsername(usernamesInput) {
+  const usernames = Array.isArray(usernamesInput)
+    ? usernamesInput.map((v) => String(v || '').trim()).filter(Boolean)
+    : [];
+  if (usernames.length === 0) return { ok: true, removed: 0 };
+
+  const cfgPath = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
+  let raw = '{}';
+  try {
+    if (fs.existsSync(cfgPath)) raw = fs.readFileSync(cfgPath, 'utf8');
+  } catch (readErr) {
+    return { ok: false, message: `gagal baca config zivpn: ${readErr.message}` };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (parseErr) {
+    return { ok: false, message: `config zivpn bukan JSON valid: ${parseErr.message}` };
+  }
+
+  const container = detectZivpnUsersContainer(parsed);
+  if (container.style === 'auth_config') {
+    // Jangan simpan duplikasi array user lain saat mode auth.config dipakai.
+    delete container.root.users;
+    delete container.root.accounts;
+    delete container.root.clients;
+  }
+  const set = new Set(usernames.map((u) => u.toLowerCase()));
+  const before = container.users.length;
+  container.users = container.users.filter((entry) => {
+    const id = container.style === 'auth_config'
+      ? String(entry || '').trim().toLowerCase()
+      : String(entry?.username ?? entry?.user ?? entry?.name ?? entry?.password ?? '').trim().toLowerCase();
+    return !set.has(id);
+  });
+  if (container.key === 'auth.config') {
+    container.root.auth.config = container.users;
+  } else if (container.key) {
+    container.root[container.key] = container.users;
+  }
+
+  try {
+    fs.writeFileSync(cfgPath, JSON.stringify(container.root, null, 2));
+  } catch (writeErr) {
+    return { ok: false, message: `gagal tulis config zivpn: ${writeErr.message}` };
+  }
+
+  return { ok: true, removed: Math.max(0, before - container.users.length) };
+}
+
+function sendExportAccounts(db, res, rawType, rawLimit) {
+  const type = String(rawType || '').trim().toLowerCase();
+  const table = getAccountTableByType(type);
+  if (!table) {
+    db.close();
+    return res.status(400).json({ ok: false, message: 'type tidak valid' });
+  }
+
+  const limit = Math.max(1, Math.min(500, Number(rawLimit || 1)));
+  db.all(
+    `SELECT * FROM ${table} WHERE UPPER(TRIM(COALESCE(status, '')))='AKTIF' ORDER BY rowid DESC LIMIT ?`,
+    [limit],
+    (err, rows) => {
+      db.close();
+      if (err) return res.status(500).json({ ok: false, message: err.message });
+      return res.json({
+        ok: true,
+        type,
+        table,
+        exported: Array.isArray(rows) ? rows.length : 0,
+        accounts: Array.isArray(rows) ? rows : []
+      });
+    }
+  );
+}
+
+function sendImportAccounts(db, res, rawType, accountsInput) {
+  const type = String(rawType || '').trim().toLowerCase();
+  const table = getAccountTableByType(type);
+  if (!table) {
+    db.close();
+    return res.status(400).json({ ok: false, message: 'type tidak valid' });
+  }
+
+  const accounts = Array.isArray(accountsInput) ? accountsInput : [];
+  if (accounts.length === 0) {
+    db.close();
+    return res.status(400).json({ ok: false, message: 'accounts kosong' });
+  }
+
+  db.all(`PRAGMA table_info(${table})`, [], (schemaErr, schemaRows) => {
+    if (schemaErr) {
+      db.close();
+      return res.status(500).json({ ok: false, message: schemaErr.message });
+    }
+
+    const columns = (Array.isArray(schemaRows) ? schemaRows : []).map((c) => String(c.name || '').trim()).filter(Boolean);
+    if (!columns.includes('username')) {
+      db.close();
+      return res.status(500).json({ ok: false, message: `kolom username tidak ada di ${table}` });
+    }
+
+    const insertCols = columns.filter((col) => accounts.some((row) => Object.prototype.hasOwnProperty.call(row || {}, col)));
+    if (!insertCols.includes('username')) insertCols.unshift('username');
+
+    const placeholders = insertCols.map(() => '?').join(',');
+    const sql = `INSERT OR REPLACE INTO ${table} (${insertCols.join(',')}) VALUES (${placeholders})`;
+    const stmt = db.prepare(sql);
+
+    let imported = 0;
+    let skipped = 0;
+    const importedUsernames = [];
+    let hasError = null;
+    let pending = 0;
+
+    const finalize = () => {
+      stmt.finalize(() => {
+        if (hasError) {
+          return db.run('ROLLBACK', () => {
+            db.close();
+            return res.status(500).json({ ok: false, message: hasError.message || String(hasError) });
+          });
+        }
+
+        return db.run('COMMIT', () => {
+          let linuxUserSync = null;
+          if (isSshLikeType(type)) {
+            linuxUserSync = syncSshLinuxUsers(accounts);
+          }
+          if (type === 'zivpn') {
+            const zivpnResult = mergeZivpnConfigFromSshAccounts(accounts);
+            if (!zivpnResult.ok) {
+              db.close();
+              return res.status(500).json({ ok: false, message: zivpnResult.message, imported, skipped });
+            }
+          }
+          db.close();
+          if (linuxUserSync && !linuxUserSync.ok) {
+            return res.status(500).json({
+              ok: false,
+              message: 'sync user linux gagal sebagian',
+              type,
+              table,
+              imported,
+              skipped,
+              usernames: importedUsernames,
+              linux_user_sync: linuxUserSync
+            });
+          }
+          return res.json({
+            ok: true,
+            type,
+            table,
+            imported,
+            skipped,
+            usernames: importedUsernames,
+            linux_user_sync: linuxUserSync || null
+          });
+        });
+      });
+    };
+
+    db.run('BEGIN IMMEDIATE TRANSACTION', (beginErr) => {
+      if (beginErr) {
+        db.close();
+        return res.status(500).json({ ok: false, message: beginErr.message });
+      }
+
+      for (const row of accounts) {
+        const username = String(row?.username || '').trim();
+        if (!username) {
+          skipped += 1;
+          continue;
+        }
+        const values = insertCols.map((col) => {
+          if (col === 'username') return username;
+          const val = row?.[col];
+          return val === undefined ? null : val;
+        });
+
+        pending += 1;
+        stmt.run(values, (runErr) => {
+          if (runErr && !hasError) hasError = runErr;
+          if (!runErr) {
+            imported += 1;
+            importedUsernames.push(username);
+          }
+          if (runErr) skipped += 1;
+          pending -= 1;
+          if (pending === 0) finalize();
+        });
+      }
+
+      if (pending === 0) finalize();
+    });
+  });
+}
+
+function sendDeleteAccounts(db, res, rawType, usernamesInput) {
+  const type = String(rawType || '').trim().toLowerCase();
+  const table = getAccountTableByType(type);
+  if (!table) {
+    db.close();
+    return res.status(400).json({ ok: false, message: 'type tidak valid' });
+  }
+
+  const usernames = Array.isArray(usernamesInput)
+    ? usernamesInput.map((v) => String(v || '').trim()).filter(Boolean)
+    : [];
+  if (usernames.length === 0) {
+    db.close();
+    return res.status(400).json({ ok: false, message: 'usernames kosong' });
+  }
+
+  const stmt = db.prepare(`DELETE FROM ${table} WHERE LOWER(username) = LOWER(?)`);
+  let deleted = 0;
+  let pending = 0;
+  let hasError = null;
+
+  const finalize = () => {
+    stmt.finalize(() => {
+      if (hasError) {
+        return db.run('ROLLBACK', () => {
+          db.close();
+          return res.status(500).json({ ok: false, message: hasError.message || String(hasError) });
+        });
+      }
+
+      return db.run('COMMIT', () => {
+        let linuxUserDelete = null;
+        if (isSshLikeType(type)) {
+          linuxUserDelete = deleteSshLinuxUsers(usernames);
+        }
+        if (type === 'zivpn') {
+          const removeResult = removeZivpnUsersByUsername(usernames);
+          if (!removeResult.ok) {
+            db.close();
+            return res.status(500).json({ ok: false, message: removeResult.message, deleted });
+          }
+        }
+        db.close();
+        if (linuxUserDelete && !linuxUserDelete.ok) {
+          return res.status(500).json({
+            ok: false,
+            message: 'hapus user linux gagal sebagian',
+            type,
+            table,
+            deleted,
+            linux_user_delete: linuxUserDelete
+          });
+        }
+        return res.json({
+          ok: true,
+          type,
+          table,
+          deleted,
+          linux_user_delete: linuxUserDelete || null
+        });
+      });
+    });
+  };
+
+  db.run('BEGIN IMMEDIATE TRANSACTION', (beginErr) => {
+    if (beginErr) {
+      db.close();
+      return res.status(500).json({ ok: false, message: beginErr.message });
+    }
+
+    for (const username of usernames) {
+      pending += 1;
+      stmt.run([username], function onRun(runErr) {
+        if (runErr && !hasError) hasError = runErr;
+        if (!runErr) deleted += Number(this?.changes || 0);
+        pending -= 1;
+        if (pending === 0) finalize();
+      });
+    }
+
+    if (pending === 0) finalize();
+  });
+}
+
+function sendDeleteAllAccounts(db, res, rawType) {
+  const type = String(rawType || '').trim().toLowerCase();
+  if (!isSshLikeType(type)) {
+    db.close();
+    return res.status(400).json({ ok: false, message: 'delete-all hanya untuk ssh/udp_http/zivpn' });
+  }
+
+  const table = getAccountTableByType(type);
+  if (!table) {
+    db.close();
+    return res.status(400).json({ ok: false, message: 'type tidak valid' });
+  }
+
+  db.all(
+    `SELECT username FROM ${table}`,
+    [],
+    (listErr, rows) => {
+      if (listErr) {
+        db.close();
+        return res.status(500).json({ ok: false, message: listErr.message });
+      }
+
+      const usernames = (Array.isArray(rows) ? rows : [])
+        .map((r) => String(r?.username || '').trim())
+        .filter(Boolean);
+
+      db.run(`DELETE FROM ${table}`, [], function onDelete(delErr) {
+        if (delErr) {
+          db.close();
+          return res.status(500).json({ ok: false, message: delErr.message });
+        }
+
+        const deletedDb = Number(this?.changes || 0);
+        const linuxUserDelete = deleteSshLinuxUsers(usernames);
+        const zivpnDelete = removeZivpnUsersByUsername(usernames);
+        db.close();
+
+        if (!zivpnDelete.ok) {
+          return res.status(500).json({
+            ok: false,
+            message: zivpnDelete.message,
+            deleted_db: deletedDb,
+            linux_user_delete: linuxUserDelete
+          });
+        }
+
+        if (!linuxUserDelete.ok) {
+          return res.status(500).json({
+            ok: false,
+            message: 'hapus user linux gagal sebagian',
+            deleted_db: deletedDb,
+            linux_user_delete: linuxUserDelete
+          });
+        }
+
+        return res.json({
+          ok: true,
+          type,
+          table,
+          deleted_db: deletedDb,
+          deleted_zivpn: Number(zivpnDelete.removed || 0),
+          linux_user_delete: linuxUserDelete
+        });
+      });
+    }
+  );
+}
+
 function authorizeAndRun(req, res, runHandler) {
   const incomingToken = String(req.headers['x-sync-token'] || '').trim();
   if (!incomingToken) {
@@ -368,6 +939,29 @@ app.get('/internal/vnstat-daily', (req, res) => {
   });
 });
 
+app.get('/internal/export-accounts', (req, res) => {
+  const type = String(req.query.type || '').trim();
+  const limit = Number(req.query.limit || 0);
+  return authorizeAndRun(req, res, (db) => sendExportAccounts(db, res, type, limit));
+});
+
+app.post('/internal/import-accounts', (req, res) => {
+  const type = String(req.body?.type || '').trim();
+  const accounts = req.body?.accounts;
+  return authorizeAndRun(req, res, (db) => sendImportAccounts(db, res, type, accounts));
+});
+
+app.post('/internal/delete-accounts', (req, res) => {
+  const type = String(req.body?.type || '').trim();
+  const usernames = req.body?.usernames;
+  return authorizeAndRun(req, res, (db) => sendDeleteAccounts(db, res, type, usernames));
+});
+
+app.post('/internal/delete-all-accounts', (req, res) => {
+  const type = String(req.body?.type || '').trim();
+  return authorizeAndRun(req, res, (db) => sendDeleteAllAccounts(db, res, type));
+});
+
 app.listen(PORT, () => {
   console.log(`summary api on port ${PORT}`);
 });
@@ -378,6 +972,7 @@ SUMMARY_PORT=${SUMMARY_PORT}
 POTATO_DB=${POTATO_DB}
 USE_DB_AUTH=1
 SYNC_TOKEN=
+ZIVPN_CONFIG=/etc/zivpn/config.json
 EOF
 
   chmod 600 "${APP_DIR}/.env"
@@ -428,6 +1023,12 @@ print_result() {
   echo
   echo "Vnstat daily check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" \"http://127.0.0.1:${SUMMARY_PORT}/internal/vnstat-daily\" && echo"
+  echo
+  echo "Export accounts check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" \"http://127.0.0.1:${SUMMARY_PORT}/internal/export-accounts?type=ssh&limit=5\" && echo"
+  echo
+  echo "Delete ALL SSH/UDP/ZIVPN check (DANGEROUS):"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"type\":\"ssh\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/delete-all-accounts\" && echo"
 }
 
 install_node_if_missing
