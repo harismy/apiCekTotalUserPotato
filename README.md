@@ -1,6 +1,6 @@
 # Dokumentasi API `setup-summary-api.sh` + Integrasi `MigrasiPotatobot`
 
-Dokumen ini menjelaskan endpoint API yang dibuat dari `scripts/setup-summary-api.sh` dan endpoint mana saja yang dipakai oleh bot publik `MigrasiPotatobot` .
+Dokumen ini menjelaskan endpoint API yang dibuat dari `setup-summary-api.sh` dan endpoint mana saja yang dipakai oleh bot `MigrasiPotatobot` .
 
 ## Install API di VPS (SC potato)
 
@@ -116,3 +116,4 @@ Untuk fitur lain di luar 3 menu utama `MigrasiPotatobot`, gunakan bot utama:
 - Repo: https://github.com/harismy/BotVPN
 
 Endpoint lain seperti `account-expiry`, `expiry-summary`, dsb bisa tetap dipakai oleh bot utama (`BotVPN`) sesuai kebutuhan integrasi.
+
