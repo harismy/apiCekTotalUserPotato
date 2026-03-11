@@ -1,17 +1,9 @@
-## Dokumentasi API untuk dipasang di SC Potato 
+# Dokumentasi API `setup-summary-api.sh` + Integrasi `MigrasiPotatobot`
 
-API ini dipakai bot untuk sinkron total akun aktif dari VPS yang udah di pasang SC potato, dan untuk lookup tanggal expired akun berdasarkan username.
+Dokumen ini menjelaskan endpoint API yang dibuat dari `scripts/setup-summary-api.sh` dan endpoint mana saja yang dipakai oleh bot publik `MigrasiPotatobot` .
 
-Base URL disesuaikan server tunnel masing-masing:
-- `http://<HOST>:8789`
+## Install API di VPS (SC potato)
 
-Semua endpoint internal wajib header:
-- `x-sync-token: <TOKEN>`
-
-Mode auth default di setup script adalah `USE_DB_AUTH=1`, jadi token divalidasi ke tabel `servers` kolom `key` di `/usr/sbin/potatonc/potato.db`.
-
-### Auto Install API (SC Potato)
-Jalankan di VPS yang udah di pasang SC potato:
 ```bash
 curl -fL --retry 5 --retry-delay 2 https://raw.githubusercontent.com/harismy/apiCekTotalUserPotato/main/setup-summary-api.sh -o /tmp/setup-summary-api.sh
 sed -i 's/\r$//' /tmp/setup-summary-api.sh
@@ -19,70 +11,108 @@ chmod +x /tmp/setup-summary-api.sh
 bash /tmp/setup-summary-api.sh
 ```
 
-### Cara Pakai di Bot (setelah API tunnel terpasang)
-1. Pastikan di database bot, setiap server sudah punya `domain` atau `sync_host` yang mengarah ke VPS tunnel(vps yang udah dipasang SC potato).
-2. Pastikan token (api key potato) di bot sama dengan token yang tervalidasi di VPS tunnel (`servers.key`).
-3. Trigger sinkron manual dari admin:
-   - Command: `/syncservernow`
-   - Tombol admin: `Sync Server Sekarang`
-4. Cek hasil sinkron di menu user `Cek Server` (terpakai/sisa/status).
-5. Sinkron otomatis jalan setiap 30 menit.
+Default API listen di port `8789`.
 
-Troubleshooting cepat:
-- `unauthorized`: token bot tidak cocok dengan token di VPS tunnel.
-- `ECONNREFUSED`: service API tunnel belum jalan atau port 8789 belum terbuka.
-### 1) Health Check
-- Method: `GET`
-- Endpoint: `/health`
-- Auth: tidak perlu token
+## Auth API
 
-Contoh:
-```bash
-curl -s http://127.0.0.1:8789/health && echo
-```
+- Header wajib: `x-sync-token: <TOKEN>`
+- Jika `USE_DB_AUTH=1` (default), token harus cocok dengan kolom `servers.key` di `potato.db`.
 
-Contoh response:
-```json
-{"ok":true,"service":"tunnel-summary","useDbAuth":true}
-```
+---
 
-### 2) Ringkasan Total Akun Aktif
-- Method: `GET`
-- Endpoint: `/internal/account-summary`
-- Auth: wajib `x-sync-token`
+## Daftar Endpoint API
 
-Contoh:
-```bash
-curl -s -H "x-sync-token: TOKEN_ANDA" http://127.0.0.1:8789/internal/account-summary && echo
-```
+### 1) Health
+- `GET /health`
+- Fungsi: cek service API aktif.
 
-Contoh response:
-```json
-{"ok":true,"ssh":87,"vmess":21,"vless":0,"trojan":0,"total":108}
-```
+### 2) Ringkasan akun aktif
+- `GET /internal/account-summary`
+- Fungsi: total akun aktif per layanan (`ssh/vmess/vless/trojan`).
 
-### 3) Lookup Expired Akun by Username
-- Method: `GET`
-- Endpoint: `/internal/account-expiry?username=<USERNAME>`
-- Auth: wajib `x-sync-token`
+### 3) Cek masa aktif akun per username
+- `GET /internal/account-expiry?username=<USERNAME>`
+- Fungsi: cari expiry akun berdasarkan username.
 
-Contoh:
-```bash
-curl -s -H "x-sync-token: TOKEN_ANDA" "http://127.0.0.1:8789/internal/account-expiry?username=haris" && echo
-```
+### 4) Ringkasan expired harian
+- `GET /internal/expiry-summary?date=YYYY-MM-DD`
+- Fungsi: total akun expired per hari.
 
-Contoh response (ketemu):
-```json
-{"ok":true,"found":true,"service":"ssh","date_exp":"2026-03-19"}
-```
+### 5) Trafik vnstat harian/bulanan
+- `GET /internal/vnstat-daily`
+- Fungsi: ambil trafik harian + bulanan dari vnstat.
 
-Contoh response (tidak ketemu):
-```json
-{"ok":true,"found":false}
-```
+### 6) Export akun (untuk migrasi)
+- `GET /internal/export-accounts?type=<ssh|zivpn|udp_http|vmess|vless|trojan>&limit=<N>`
+- Fungsi: ambil akun dari DB sumber (urutan terbaru `rowid DESC`).
 
-### Error Umum
-- `401 unauthorized`: token salah / tidak ada / tidak terdaftar di DB tunnel
-- `400 username required`: query `username` belum dikirim pada endpoint expiry
-- `500`: error internal API atau akses DB
+### 7) Import akun (untuk migrasi)
+- `POST /internal/import-accounts`
+- Body:
+  ```json
+  {
+    "type": "ssh",
+    "accounts": [ ... ]
+  }
+  ```
+- Fungsi:
+  - insert/replace akun ke DB tujuan,
+  - untuk `ssh/zivpn/udp_http`: sinkron user Linux (useradd/chpasswd/chage),
+  - untuk `zivpn`: sinkron `/etc/zivpn/config.json`.
 
+### 8) Delete akun by username (untuk migrasi move)
+- `POST /internal/delete-accounts`
+- Body:
+  ```json
+  {
+    "type": "ssh",
+    "usernames": ["user1","user2"]
+  }
+  ```
+- Fungsi: hapus akun terpilih dari DB (dan sinkron linux user / zivpn config untuk tipe ssh-like).
+
+### 9) Delete semua akun ssh/zivpn
+- `POST /internal/delete-all-accounts`
+- Body:
+  ```json
+  {
+    "type": "ssh"
+  }
+  ```
+- Fungsi: hapus massal akun SSH/ZIVPN (DB + linux user + config zivpn).
+
+---
+
+## Endpoint yang dipakai `MigrasiPotatobot` (hanya 3 menu utama)
+
+`MigrasiPotatobot` hanya punya 3 menu:
+
+1. **Cek Bandwidth Server**
+2. **Migrasi User Server**
+3. **Hapus Semua Akun SSH/ZIVPN**
+
+Endpoint yang dipakai:
+
+- Menu **Cek Bandwidth Server**
+  - `GET /internal/account-summary`
+  - `GET /internal/vnstat-daily`
+
+- Menu **Migrasi User Server**
+  - `GET /internal/export-accounts`
+  - `POST /internal/import-accounts`
+  - `POST /internal/delete-accounts`
+
+- Menu **Hapus Semua Akun SSH/ZIVPN**
+  - `POST /internal/delete-all-accounts`
+
+> Catatan: di `MigrasiPotatobot`, user selalu input manual `hostname + key` untuk sumber/tujuan. Bot tidak menyimpan data submit tersebut.
+
+---
+
+## Integrasi dengan Bot Utama
+
+Untuk fitur lain di luar 3 menu utama `MigrasiPotatobot`, gunakan bot utama:
+
+- Repo: https://github.com/harismy/BotVPN
+
+Endpoint lain seperti `account-expiry`, `expiry-summary`, dsb bisa tetap dipakai oleh bot utama (`BotVPN`) sesuai kebutuhan integrasi.
