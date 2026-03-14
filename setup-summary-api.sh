@@ -577,6 +577,28 @@ function removeZivpnUsersByUsername(usernamesInput) {
   return { ok: true, removed: Math.max(0, before - container.users.length) };
 }
 
+function restoreZivpnConfig(configInput) {
+  if (!configInput || typeof configInput !== 'object') {
+    return { ok: false, message: 'config harus JSON object' };
+  }
+
+  const cfgPath = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
+  const clone = JSON.parse(JSON.stringify(configInput));
+
+  // Validasi minimum agar tidak menulis file random.
+  if (!clone.auth || typeof clone.auth !== 'object' || !Array.isArray(clone.auth.config)) {
+    return { ok: false, message: 'config.auth.config wajib ada dan harus array' };
+  }
+
+  try {
+    fs.writeFileSync(cfgPath, JSON.stringify(clone, null, 2));
+  } catch (writeErr) {
+    return { ok: false, message: `gagal tulis config zivpn: ${writeErr.message}` };
+  }
+
+  return { ok: true, path: cfgPath, total: clone.auth.config.length };
+}
+
 function sendExportAccounts(db, res, rawType, rawLimit) {
   const type = String(rawType || '').trim().toLowerCase();
   const table = getAccountTableByType(type);
@@ -960,6 +982,22 @@ app.post('/internal/delete-accounts', (req, res) => {
 app.post('/internal/delete-all-accounts', (req, res) => {
   const type = String(req.body?.type || '').trim();
   return authorizeAndRun(req, res, (db) => sendDeleteAllAccounts(db, res, type));
+});
+
+app.post('/internal/restore-zivpn-config', (req, res) => {
+  const config = req.body?.config;
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = restoreZivpnConfig(config);
+    if (!result.ok) {
+      return res.status(400).json({ ok: false, message: result.message });
+    }
+    return res.json({
+      ok: true,
+      path: result.path,
+      total_entries: Number(result.total || 0)
+    });
+  });
 });
 
 app.listen(PORT, () => {
