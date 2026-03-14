@@ -988,11 +988,15 @@ install_dependencies() {
   # jadi paksa build from source agar kompatibel dengan sistem.
   log "Installing build tools for sqlite3 (source build)..."
   apt-get update -y
-  apt-get install -y build-essential python3 make g++ gcc libc6-dev
+  apt-get install -y build-essential python3 make g++ gcc libc6-dev pkg-config
 
   log "Installing npm dependencies..."
+  # Bersihkan hasil install lama agar sqlite3 binary lama tidak kepakai.
+  rm -rf node_modules package-lock.json
+  npm cache clean --force >/dev/null 2>&1 || true
+
   npm install express dotenv --omit=dev
-  npm install sqlite3 --build-from-source --unsafe-perm --omit=dev
+  npm_config_build_from_source=true npm install sqlite3 --unsafe-perm --omit=dev --foreground-scripts
 }
 
 start_pm2_service() {
