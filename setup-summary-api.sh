@@ -983,7 +983,16 @@ install_dependencies() {
   if [[ ! -f package.json ]]; then
     npm init -y >/dev/null 2>&1
   fi
-  npm install express sqlite3 dotenv --omit=dev
+
+  # sqlite3 prebuilt sering gagal di VPS dengan glibc lama,
+  # jadi paksa build from source agar kompatibel dengan sistem.
+  log "Installing build tools for sqlite3 (source build)..."
+  apt-get update -y
+  apt-get install -y build-essential python3 make g++ gcc libc6-dev
+
+  log "Installing npm dependencies..."
+  npm install express dotenv --omit=dev
+  npm install sqlite3 --build-from-source --unsafe-perm --omit=dev
 }
 
 start_pm2_service() {
