@@ -996,7 +996,15 @@ install_dependencies() {
   npm cache clean --force >/dev/null 2>&1 || true
 
   npm install express dotenv --omit=dev
-  npm_config_build_from_source=true npm install sqlite3 --unsafe-perm --omit=dev --foreground-scripts
+
+  # Paksa compile sqlite3 dari source (jangan ambil prebuilt binary).
+  export npm_config_build_from_source=true
+  export npm_config_fallback_to_build=true
+  export npm_config_update_binary=false
+  npm install sqlite3@5.1.7 --unsafe-perm --omit=dev --build-from-source --foreground-scripts --verbose
+
+  # Verifikasi binary sqlite3 harus load normal.
+  node -e "require('sqlite3'); console.log('sqlite3 load ok')"
 }
 
 start_pm2_service() {
