@@ -577,6 +577,48 @@ function removeZivpnUsersByUsername(usernamesInput) {
   return { ok: true, removed: Math.max(0, before - container.users.length) };
 }
 
+function clearAllZivpnUsers() {
+  const cfgPath = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
+  let raw = '{}';
+  try {
+    if (fs.existsSync(cfgPath)) raw = fs.readFileSync(cfgPath, 'utf8');
+  } catch (readErr) {
+    return { ok: false, message: `gagal baca config zivpn: ${readErr.message}` };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (parseErr) {
+    return { ok: false, message: `config zivpn bukan JSON valid: ${parseErr.message}` };
+  }
+
+  const container = detectZivpnUsersContainer(parsed);
+  const before = Array.isArray(container.users) ? container.users.length : 0;
+  container.users = [];
+  if (container.key === 'auth.config') {
+    if (!container.root.auth || typeof container.root.auth !== 'object') container.root.auth = {};
+    container.root.auth.config = container.users;
+  } else if (container.key) {
+    container.root[container.key] = container.users;
+  }
+
+  // Jika format auth.config dipakai, pastikan tidak ada duplikasi array lain.
+  if (container.style === 'auth_config') {
+    delete container.root.users;
+    delete container.root.accounts;
+    delete container.root.clients;
+  }
+
+  try {
+    fs.writeFileSync(cfgPath, JSON.stringify(container.root, null, 2));
+  } catch (writeErr) {
+    return { ok: false, message: `gagal tulis config zivpn: ${writeErr.message}` };
+  }
+
+  return { ok: true, removed: before, path: cfgPath };
+}
+
 function restoreZivpnConfig(configInput) {
   if (!configInput || typeof configInput !== 'object') {
     return { ok: false, message: 'config harus JSON object' };
@@ -675,6 +717,7 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
 
         return db.run('COMMIT', () => {
           let linuxUserSync = null;
+          let zivpnServiceReload = null;
           if (isSshLikeType(type)) {
             linuxUserSync = syncSshLinuxUsers(accounts);
           }
@@ -684,6 +727,7 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
               db.close();
               return res.status(500).json({ ok: false, message: zivpnResult.message, imported, skipped });
             }
+            zivpnServiceReload = reloadZivpnService();
           }
           db.close();
           if (linuxUserSync && !linuxUserSync.ok) {
@@ -705,7 +749,8 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
             imported,
             skipped,
             usernames: importedUsernames,
-            linux_user_sync: linuxUserSync || null
+            linux_user_sync: linuxUserSync || null,
+            zivpn_service_reload: zivpnServiceReload
           });
         });
       });
@@ -779,6 +824,7 @@ function sendDeleteAccounts(db, res, rawType, usernamesInput) {
 
       return db.run('COMMIT', () => {
         let linuxUserDelete = null;
+        let zivpnServiceReload = null;
         if (isSshLikeType(type)) {
           linuxUserDelete = deleteSshLinuxUsers(usernames);
         }
@@ -788,6 +834,7 @@ function sendDeleteAccounts(db, res, rawType, usernamesInput) {
             db.close();
             return res.status(500).json({ ok: false, message: removeResult.message, deleted });
           }
+          zivpnServiceReload = reloadZivpnService();
         }
         db.close();
         if (linuxUserDelete && !linuxUserDelete.ok) {
@@ -805,7 +852,8 @@ function sendDeleteAccounts(db, res, rawType, usernamesInput) {
           type,
           table,
           deleted,
-          linux_user_delete: linuxUserDelete || null
+          linux_user_delete: linuxUserDelete || null,
+          zivpn_service_reload: zivpnServiceReload
         });
       });
     });
@@ -865,7 +913,10 @@ function sendDeleteAllAccounts(db, res, rawType) {
 
         const deletedDb = Number(this?.changes || 0);
         const linuxUserDelete = deleteSshLinuxUsers(usernames);
-        const zivpnDelete = removeZivpnUsersByUsername(usernames);
+        const zivpnDelete = type === 'zivpn'
+          ? clearAllZivpnUsers()
+          : removeZivpnUsersByUsername(usernames);
+        const zivpnServiceReload = type === 'zivpn' ? reloadZivpnService() : null;
         db.close();
 
         if (!zivpnDelete.ok) {
@@ -892,11 +943,87 @@ function sendDeleteAllAccounts(db, res, rawType) {
           table,
           deleted_db: deletedDb,
           deleted_zivpn: Number(zivpnDelete.removed || 0),
-          linux_user_delete: linuxUserDelete
+          linux_user_delete: linuxUserDelete,
+          zivpn_service_reload: zivpnServiceReload
         });
       });
     }
   );
+}
+
+function getZivpnServiceCandidates() {
+  const fromEnv = String(process.env.ZIVPN_SERVICE || '').trim();
+  const defaults = ['zivpn', 'zivpn.service', 'udp-custom', 'udp-custom.service'];
+  return fromEnv ? [fromEnv, ...defaults] : defaults;
+}
+
+function tryServiceAction(action, serviceName) {
+  const act = String(action || '').trim().toLowerCase();
+  const svc = String(serviceName || '').trim();
+  if (!svc) return false;
+  if (!['start', 'stop', 'restart', 'status'].includes(act)) return false;
+
+  try {
+    if (act === 'status') {
+      const out = execFileSync('systemctl', ['is-active', svc], { stdio: ['ignore', 'pipe', 'pipe'] });
+      return String(out || '').trim();
+    }
+    execFileSync('systemctl', [act, svc], { stdio: 'ignore' });
+    return true;
+  } catch (_) {
+    try {
+      if (act === 'status') {
+        execFileSync('service', [svc, 'status'], { stdio: 'ignore' });
+        return 'active';
+      }
+      execFileSync('service', [svc, act], { stdio: 'ignore' });
+      return true;
+    } catch (__){
+      return false;
+    }
+  }
+}
+
+function controlZivpnService(action) {
+  const act = String(action || '').trim().toLowerCase();
+  if (!['start', 'stop', 'restart', 'status'].includes(act)) {
+    return { ok: false, message: 'action harus start/stop/restart/status' };
+  }
+
+  const candidates = getZivpnServiceCandidates();
+  for (const svc of candidates) {
+    const result = tryServiceAction(act, svc);
+    if (result) {
+      return { ok: true, action: act, service: svc, status: typeof result === 'string' ? result : undefined };
+    }
+  }
+
+  return {
+    ok: false,
+    message: 'service zivpn tidak ditemukan. Set env ZIVPN_SERVICE pada .env jika nama service custom.',
+    tried: candidates
+  };
+}
+
+function reloadZivpnService() {
+  const restart = controlZivpnService('restart');
+  if (restart.ok) {
+    return { ok: true, method: 'restart', service: restart.service };
+  }
+
+  const stop = controlZivpnService('stop');
+  const start = controlZivpnService('start');
+  if (stop.ok && start.ok) {
+    return { ok: true, method: 'stop+start', service: start.service || stop.service };
+  }
+
+  return {
+    ok: false,
+    message: 'gagal reload service zivpn',
+    restart,
+    stop,
+    start
+  };
 }
 
 function authorizeAndRun(req, res, runHandler) {
@@ -992,11 +1119,25 @@ app.post('/internal/restore-zivpn-config', (req, res) => {
     if (!result.ok) {
       return res.status(400).json({ ok: false, message: result.message });
     }
+    const zivpnServiceReload = reloadZivpnService();
     return res.json({
       ok: true,
       path: result.path,
-      total_entries: Number(result.total || 0)
+      total_entries: Number(result.total || 0),
+      zivpn_service_reload: zivpnServiceReload
     });
+  });
+});
+
+app.post('/internal/zivpn-service', (req, res) => {
+  const action = String(req.body?.action || '').trim();
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = controlZivpnService(action);
+    if (!result.ok) {
+      return res.status(400).json(result);
+    }
+    return res.json({ ok: true, action: result.action, service: result.service, status: result.status || '-' });
   });
 });
 
@@ -1011,6 +1152,7 @@ POTATO_DB=${POTATO_DB}
 USE_DB_AUTH=1
 SYNC_TOKEN=
 ZIVPN_CONFIG=/etc/zivpn/config.json
+ZIVPN_SERVICE=
 EOF
 
   chmod 600 "${APP_DIR}/.env"
@@ -1088,6 +1230,9 @@ print_result() {
   echo
   echo "Delete ALL SSH/UDP/ZIVPN check (DANGEROUS):"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"type\":\"ssh\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/delete-all-accounts\" && echo"
+  echo
+  echo "ZIVPN service control check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"action\":\"status\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/zivpn-service\" && echo"
 }
 
 install_node_if_missing
