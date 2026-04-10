@@ -72,6 +72,8 @@ const USE_DB_AUTH = String(process.env.USE_DB_AUTH || '1') !== '0';
 const STATIC_TOKEN = (process.env.SYNC_TOKEN || '').trim();
 const FULL_RESTORE_SCRIPT = String(process.env.FULL_RESTORE_SCRIPT || '/usr/local/sbin/sc-1forcr-restore-backup').trim();
 const RESTORE_TMP_DIR = String(process.env.RESTORE_TMP_DIR || '/tmp').trim();
+const BANNER_HTML_FILE = String(process.env.BANNER_HTML_FILE || '/etc/sc-1forcr/banner.html').trim();
+const BANNER_TXT_FILE = String(process.env.BANNER_TXT_FILE || '/etc/sc-1forcr/banner.txt').trim();
 
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
@@ -661,6 +663,120 @@ function sendExportZivpnConfig(res) {
   }
 }
 
+function sendExportZivpnAuth(res) {
+  const cfgPath = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
+  try {
+    if (!fs.existsSync(cfgPath)) {
+      return res.status(404).json({ ok: false, message: `config tidak ditemukan: ${cfgPath}` });
+    }
+    const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    const authList = Array.isArray(parsed?.auth?.config) ? parsed.auth.config : [];
+    const users = [];
+    const seen = new Set();
+    for (const item of authList) {
+      const v = String(item || '').trim().toLowerCase();
+      if (!v || seen.has(v)) continue;
+      seen.add(v);
+      users.push(v);
+    }
+    return res.json({ ok: true, path: cfgPath, total: users.length, users });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: `gagal export auth zivpn: ${err.message}` });
+  }
+}
+
+function restoreZivpnAuth(usersInput) {
+  const cfgPath = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
+  const raw = Array.isArray(usersInput) ? usersInput : [];
+  const users = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const v = String(item || '').trim().toLowerCase();
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    users.push(v);
+  }
+
+  let root = {};
+  try {
+    if (fs.existsSync(cfgPath)) {
+      root = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    }
+  } catch (_) {
+    root = {};
+  }
+  if (!root || typeof root !== 'object') root = {};
+  if (!root.auth || typeof root.auth !== 'object') root.auth = {};
+  root.auth.mode = 'passwords';
+  root.auth.config = users;
+
+  try {
+    fs.writeFileSync(cfgPath, JSON.stringify(root, null, 2));
+  } catch (err) {
+    return { ok: false, message: `gagal tulis auth zivpn: ${err.message}` };
+  }
+
+  return { ok: true, path: cfgPath, total: users.length };
+}
+
+function sendExportBannerConfig(res) {
+  try {
+    const out = {
+      ok: true,
+      banner_html: '',
+      banner_txt: '',
+      html_path: BANNER_HTML_FILE,
+      txt_path: BANNER_TXT_FILE
+    };
+    if (BANNER_HTML_FILE && fs.existsSync(BANNER_HTML_FILE)) {
+      out.banner_html = fs.readFileSync(BANNER_HTML_FILE, 'utf8');
+    }
+    if (BANNER_TXT_FILE && fs.existsSync(BANNER_TXT_FILE)) {
+      out.banner_txt = fs.readFileSync(BANNER_TXT_FILE, 'utf8');
+    }
+    return res.json(out);
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: `gagal export banner: ${err.message}` });
+  }
+}
+
+function restoreBannerConfig(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return { ok: false, message: 'payload banner harus object' };
+  }
+  const hasHtml = Object.prototype.hasOwnProperty.call(payload, 'banner_html');
+  const hasTxt = Object.prototype.hasOwnProperty.call(payload, 'banner_txt');
+  const html = hasHtml ? String(payload.banner_html || '') : null;
+  const txt = hasTxt ? String(payload.banner_txt || '') : null;
+  if (!hasHtml && !hasTxt) {
+    return { ok: false, message: 'banner_html atau banner_txt wajib diisi' };
+  }
+
+  try {
+    fs.mkdirSync('/etc/sc-1forcr', { recursive: true });
+    if (hasHtml) {
+      if (html) fs.writeFileSync(BANNER_HTML_FILE, html, 'utf8');
+      else if (fs.existsSync(BANNER_HTML_FILE)) fs.unlinkSync(BANNER_HTML_FILE);
+    }
+    if (hasTxt) {
+      if (txt) fs.writeFileSync(BANNER_TXT_FILE, txt, 'utf8');
+      else if (fs.existsSync(BANNER_TXT_FILE)) fs.unlinkSync(BANNER_TXT_FILE);
+    }
+    if (fs.existsSync(BANNER_HTML_FILE)) fs.chmodSync(BANNER_HTML_FILE, 0o644);
+    if (fs.existsSync(BANNER_TXT_FILE)) fs.chmodSync(BANNER_TXT_FILE, 0o644);
+  } catch (err) {
+    return { ok: false, message: `gagal restore banner: ${err.message}` };
+  }
+
+  return {
+    ok: true,
+    html_written: hasHtml && !!html,
+    txt_written: hasTxt && !!txt,
+    html_path: BANNER_HTML_FILE,
+    txt_path: BANNER_TXT_FILE
+  };
+}
+
 function sendExportAccounts(db, res, rawType, rawLimit) {
   const type = String(rawType || '').trim().toLowerCase();
   const table = getAccountTableByType(type);
@@ -669,7 +785,7 @@ function sendExportAccounts(db, res, rawType, rawLimit) {
     return res.status(400).json({ ok: false, message: 'type tidak valid' });
   }
 
-  const limit = Math.max(1, Math.min(500, Number(rawLimit || 1)));
+  const limit = Math.max(1, Math.min(50000, Number(rawLimit || 1000)));
   db.all(
     `SELECT * FROM ${table} WHERE UPPER(TRIM(COALESCE(status, '')))='AKTIF' ORDER BY rowid DESC LIMIT ?`,
     [limit],
@@ -1177,6 +1293,20 @@ app.get('/internal/export-zivpn-config', (req, res) => {
   });
 });
 
+app.get('/internal/export-zivpn-auth', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    return sendExportZivpnAuth(res);
+  });
+});
+
+app.get('/internal/export-banner-config', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    return sendExportBannerConfig(res);
+  });
+});
+
 app.post('/internal/import-accounts', (req, res) => {
   const type = String(req.body?.type || '').trim();
   const accounts = req.body?.accounts;
@@ -1209,6 +1339,35 @@ app.post('/internal/restore-zivpn-config', (req, res) => {
       total_entries: Number(result.total || 0),
       zivpn_service_reload: zivpnServiceReload
     });
+  });
+});
+
+app.post('/internal/restore-zivpn-auth', (req, res) => {
+  const users = req.body?.users;
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = restoreZivpnAuth(users);
+    if (!result.ok) {
+      return res.status(400).json({ ok: false, message: result.message });
+    }
+    const zivpnServiceReload = reloadZivpnService();
+    return res.json({
+      ok: true,
+      path: result.path,
+      total_entries: Number(result.total || 0),
+      zivpn_service_reload: zivpnServiceReload
+    });
+  });
+});
+
+app.post('/internal/restore-banner-config', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = restoreBannerConfig(req.body || {});
+    if (!result.ok) {
+      return res.status(400).json({ ok: false, message: result.message });
+    }
+    return res.json(result);
   });
 });
 
@@ -1249,6 +1408,8 @@ USE_DB_AUTH=1
 SYNC_TOKEN=
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=
+BANNER_HTML_FILE=/etc/sc-1forcr/banner.html
+BANNER_TXT_FILE=/etc/sc-1forcr/banner.txt
 FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
 RESTORE_TMP_DIR=/tmp
 EOF
