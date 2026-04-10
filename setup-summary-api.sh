@@ -70,6 +70,8 @@ const PORT = Number(process.env.SUMMARY_PORT || 8789);
 const DB = process.env.POTATO_DB || '/usr/sbin/potatonc/potato.db';
 const USE_DB_AUTH = String(process.env.USE_DB_AUTH || '1') !== '0';
 const STATIC_TOKEN = (process.env.SYNC_TOKEN || '').trim();
+const FULL_RESTORE_SCRIPT = String(process.env.FULL_RESTORE_SCRIPT || '/usr/local/sbin/sc-1forcr-restore-backup').trim();
+const RESTORE_TMP_DIR = String(process.env.RESTORE_TMP_DIR || '/tmp').trim();
 
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
@@ -641,6 +643,24 @@ function restoreZivpnConfig(configInput) {
   return { ok: true, path: cfgPath, total: clone.auth.config.length };
 }
 
+function sendExportZivpnConfig(res) {
+  const cfgPath = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
+  try {
+    if (!fs.existsSync(cfgPath)) {
+      return res.status(404).json({ ok: false, message: `config tidak ditemukan: ${cfgPath}` });
+    }
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return res.json({
+      ok: true,
+      path: cfgPath,
+      config: parsed
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: `gagal export config zivpn: ${err.message}` });
+  }
+}
+
 function sendExportAccounts(db, res, rawType, rawLimit) {
   const type = String(rawType || '').trim().toLowerCase();
   const table = getAccountTableByType(type);
@@ -1026,6 +1046,62 @@ function reloadZivpnService() {
   };
 }
 
+function isAllowedTelegramFileUrl(rawUrl) {
+  const url = String(rawUrl || '').trim();
+  return /^https:\/\/api\.telegram\.org\/file\/bot[^/]+\/.+$/i.test(url);
+}
+
+function safeFileToken(raw) {
+  const token = String(raw || '').trim();
+  if (!token) return 'backup';
+  return token.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'backup';
+}
+
+function runFullBackupRestoreFromUrl(fileUrl, fileNameInput) {
+  if (!isAllowedTelegramFileUrl(fileUrl)) {
+    return { ok: false, statusCode: 400, message: 'file_url tidak valid (hanya telegram file URL).' };
+  }
+  if (!fs.existsSync(FULL_RESTORE_SCRIPT)) {
+    return { ok: false, statusCode: 500, message: `restore script tidak ditemukan: ${FULL_RESTORE_SCRIPT}` };
+  }
+
+  const fileName = String(fileNameInput || '').trim().toLowerCase();
+  if (!(fileName.endsWith('.tar.gz') || fileName.endsWith('.tgz'))) {
+    return { ok: false, statusCode: 400, message: 'file_name harus .tar.gz atau .tgz' };
+  }
+
+  const stamp = Date.now();
+  const tmpName = `sc1forcr-restore-${safeFileToken(fileName || `backup-${stamp}.tar.gz`)}`;
+  const tmpPath = `${RESTORE_TMP_DIR}/${tmpName}`;
+
+  try {
+    execFileSync('curl', ['-fsSL', '--retry', '3', '--retry-delay', '2', String(fileUrl), '-o', tmpPath], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: 3 * 60 * 1000
+    });
+    execFileSync('tar', ['-tzf', tmpPath], { stdio: ['ignore', 'ignore', 'pipe'], timeout: 60 * 1000 });
+    execFileSync(FULL_RESTORE_SCRIPT, [tmpPath], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: 10 * 60 * 1000
+    });
+
+    try { fs.unlinkSync(tmpPath); } catch (_) {}
+    return {
+      ok: true,
+      restored: true,
+      file: fileName,
+      services_restarted: true
+    };
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch (_) {}
+    return {
+      ok: false,
+      statusCode: 500,
+      message: err?.message || 'restore full backup gagal'
+    };
+  }
+}
+
 function authorizeAndRun(req, res, runHandler) {
   const incomingToken = String(req.headers['x-sync-token'] || '').trim();
   if (!incomingToken) {
@@ -1094,6 +1170,13 @@ app.get('/internal/export-accounts', (req, res) => {
   return authorizeAndRun(req, res, (db) => sendExportAccounts(db, res, type, limit));
 });
 
+app.get('/internal/export-zivpn-config', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    return sendExportZivpnConfig(res);
+  });
+});
+
 app.post('/internal/import-accounts', (req, res) => {
   const type = String(req.body?.type || '').trim();
   const accounts = req.body?.accounts;
@@ -1129,6 +1212,19 @@ app.post('/internal/restore-zivpn-config', (req, res) => {
   });
 });
 
+app.post('/internal/restore-full-backup-url', (req, res) => {
+  const fileUrl = String(req.body?.file_url || '').trim();
+  const fileName = String(req.body?.file_name || '').trim();
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = runFullBackupRestoreFromUrl(fileUrl, fileName);
+    if (!result.ok) {
+      return res.status(Number(result.statusCode || 500)).json({ ok: false, message: result.message });
+    }
+    return res.json(result);
+  });
+});
+
 app.post('/internal/zivpn-service', (req, res) => {
   const action = String(req.body?.action || '').trim();
   return authorizeAndRun(req, res, (db) => {
@@ -1153,6 +1249,8 @@ USE_DB_AUTH=1
 SYNC_TOKEN=
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=
+FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
+RESTORE_TMP_DIR=/tmp
 EOF
 
   chmod 600 "${APP_DIR}/.env"
@@ -1233,6 +1331,11 @@ print_result() {
   echo
   echo "ZIVPN service control check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"action\":\"status\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/zivpn-service\" && echo"
+  echo
+  echo "Full restore from Telegram URL check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" \\"
+  echo "    -d '{\"file_url\":\"https://api.telegram.org/file/bot.../backup.tar.gz\",\"file_name\":\"backup.tar.gz\"}' \\"
+  echo "    \"http://127.0.0.1:${SUMMARY_PORT}/internal/restore-full-backup-url\" && echo"
 }
 
 install_node_if_missing
