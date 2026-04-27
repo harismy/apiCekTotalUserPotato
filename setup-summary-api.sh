@@ -482,7 +482,7 @@ function restartXrayService() {
   }
 }
 
-function syncXrayConfigFromDbByType(typeInput) {
+function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
   return new Promise((resolve) => {
     const type = getXrayProtocolByType(typeInput);
     if (!type) {
@@ -538,22 +538,28 @@ function syncXrayConfigFromDbByType(typeInput) {
           return resolve({ ok: false, statusCode: 500, message: `gagal tulis config xray: ${writeErr.message}` });
         }
 
-        const restart = restartXrayService();
-        if (!restart.ok) {
-          return resolve({
-            ok: false,
-            statusCode: 500,
-            message: restart.message || 'restart xray gagal',
-            type,
-            synced_clients: normalizedClients.length
-          });
+        const shouldRestart = !!restartAfter;
+        let restart = null;
+        if (shouldRestart) {
+          restart = restartXrayService();
+          if (!restart.ok) {
+            return resolve({
+              ok: false,
+              statusCode: 500,
+              message: restart.message || 'restart xray gagal',
+              type,
+              synced_clients: normalizedClients.length
+            });
+          }
         }
         return resolve({
           ok: true,
           type,
           table,
           synced_clients: normalizedClients.length,
-          xray_restart: restart
+          restart_applied: shouldRestart,
+          xray_restart: restart,
+          xray_needs_restart: !shouldRestart
         });
       }
     );
@@ -1031,7 +1037,7 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
             });
           };
           if (getXrayProtocolByType(type)) {
-            return syncXrayConfigFromDbByType(type).then((syncRes) => {
+            return syncXrayConfigFromDbByType(type, false).then((syncRes) => {
               if (!syncRes.ok) {
                 return res.status(Number(syncRes.statusCode || 500)).json({
                   ok: false,
@@ -1155,7 +1161,7 @@ function sendDeleteAccounts(db, res, rawType, usernamesInput) {
           });
         };
         if (getXrayProtocolByType(type)) {
-          return syncXrayConfigFromDbByType(type).then((syncRes) => {
+          return syncXrayConfigFromDbByType(type, false).then((syncRes) => {
             if (!syncRes.ok) {
               return res.status(Number(syncRes.statusCode || 500)).json({
                 ok: false,
@@ -1668,9 +1674,11 @@ app.post('/internal/renew-xray-account', (req, res) => {
 
 app.post('/internal/sync-xray-from-db', (req, res) => {
   const type = String(req.body?.type || '').trim().toLowerCase();
+  const restartRaw = req.body?.restart;
+  const restart = restartRaw === true || /^(1|true|yes|on)$/i.test(String(restartRaw || '').trim());
   return authorizeAndRun(req, res, (db) => {
     db.close();
-    syncXrayConfigFromDbByType(type)
+    syncXrayConfigFromDbByType(type, restart)
       .then((result) => {
         if (!result.ok) {
           return res.status(Number(result.statusCode || 500)).json(result);
@@ -1680,6 +1688,17 @@ app.post('/internal/sync-xray-from-db', (req, res) => {
       .catch((err) => {
         return res.status(500).json({ ok: false, message: err?.message || 'sync xray gagal' });
       });
+  });
+});
+
+app.post('/internal/apply-xray-restart', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const restart = restartXrayService();
+    if (!restart.ok) {
+      return res.status(500).json({ ok: false, message: restart.message || 'restart xray gagal' });
+    }
+    return res.json({ ok: true, xray_restart: restart });
   });
 });
 
@@ -1795,6 +1814,9 @@ print_result() {
   echo
   echo "Sync Xray from DB check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"type\":\"vmess\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sync-xray-from-db\" && echo"
+  echo
+  echo "Apply Xray restart check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/apply-xray-restart\" && echo"
   echo
   echo "Full restore from Telegram URL check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" \\"
