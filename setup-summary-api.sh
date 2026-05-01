@@ -77,7 +77,7 @@ const BANNER_TXT_FILE = String(process.env.BANNER_TXT_FILE || '/etc/sc-1forcr/ba
 const XRAY_CONFIG_FILE = String(process.env.XRAY_CONFIG_FILE || '/usr/local/etc/xray/config.json').trim();
 const SC_ACCESS_LOCK_FILE = String(process.env.SC_ACCESS_LOCK_FILE || '/etc/sc-1forcr-access.lock').trim();
 const SC_RUNTIME_ENV_FILE = String(process.env.SC_RUNTIME_ENV_FILE || '/etc/sc-1forcr.env').trim();
-const UPDATE_INFO_FILE = String(process.env.UPDATE_INFO_FILE || '/etc/sc-1forcr/update-info.env').trim();
+const SC_REG_META_FILE = String(process.env.SC_REG_META_FILE || '/etc/sc-1forcr-registration.env').trim();
 
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
@@ -1451,68 +1451,6 @@ function applyScAccessLock(blockedInput, reasonInput, actorInput) {
   }
 }
 
-function runCommand(command, timeoutMs = 20 * 60 * 1000) {
-  try {
-    const out = execFileSync('bash', ['-lc', String(command || '')], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: Number(timeoutMs) || (20 * 60 * 1000)
-    });
-    return { ok: true, output: String(out || '').trim() };
-  } catch (err) {
-    return {
-      ok: false,
-      message: err?.message || 'command gagal',
-      stderr: String(err?.stderr || '').trim(),
-      stdout: String(err?.stdout || '').trim()
-    };
-  }
-}
-
-function triggerScAutoUpdate() {
-  const cmd = [
-    'set -euo pipefail',
-    '[ -f /etc/sc-1forcr.env ] && source /etc/sc-1forcr.env || true',
-    'URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh}"',
-    'TMP="$(mktemp /tmp/sc-1forcr-update-XXXXXX.sh)"',
-    'curl -fsSL "$URL" -o "$TMP"',
-    "sed -i 's/\\r$//' \"$TMP\"",
-    'chmod +x "$TMP"',
-    'bash "$TMP"',
-    'rm -f "$TMP"'
-  ].join('\n');
-  const run = runCommand(cmd, 35 * 60 * 1000);
-  if (!run.ok) {
-    return {
-      ok: false,
-      statusCode: 500,
-      message: run.message || 'trigger update SC gagal',
-      stderr: run.stderr || null,
-      stdout: run.stdout || null
-    };
-  }
-  return { ok: true, component: 'sc', output: run.output || '' };
-}
-
-function restartCoreApiServices() {
-  const cmd = [
-    'set -e',
-    'systemctl restart sc-1forcr-api',
-    'systemctl restart sc-1forcr-sshws || true'
-  ].join('\n');
-  const run = runCommand(cmd, 2 * 60 * 1000);
-  if (!run.ok) {
-    return {
-      ok: false,
-      statusCode: 500,
-      message: run.message || 'restart API gagal',
-      stderr: run.stderr || null,
-      stdout: run.stdout || null
-    };
-  }
-  return { ok: true, component: 'api', output: run.output || '' };
-}
-
 function sanitizeUpdateLine(input, maxLen = 512) {
   return String(input || '')
     .replace(/\r\n/g, '\n')
@@ -1524,54 +1462,43 @@ function sanitizeUpdateLine(input, maxLen = 512) {
     .slice(0, Math.max(1, Number(maxLen) || 512));
 }
 
-function writeReleaseInfoFile(componentInput, versionInput, descriptionInput, actorInput) {
-  const component = sanitizeUpdateLine(componentInput || '', 16).toLowerCase() || 'both';
-  const version = sanitizeUpdateLine(versionInput || '', 64);
-  const description = sanitizeUpdateLine(descriptionInput || '', 1200);
-  const actor = sanitizeUpdateLine(actorInput || '', 64);
-  const now = new Date();
-  const iso = now.toISOString();
-  const local = now.toLocaleString('id-ID', { hour12: false, timeZone: 'Asia/Jakarta' });
-
-  try {
-    const dir = require('path').dirname(UPDATE_INFO_FILE);
-    fs.mkdirSync(dir, { recursive: true });
-  } catch (_) {}
-
-  const payload = [
-    `UPDATE_COMPONENT=${component || '-'}`,
-    `UPDATE_VERSION=${version || '-'}`,
-    `UPDATE_DESC=${description || '-'}`,
-    `UPDATE_ACTOR=${actor || '-'}`,
-    `UPDATE_AT_ISO=${iso}`,
-    `UPDATE_AT_LOCAL=${sanitizeUpdateLine(local, 80) || '-'}`,
-    ''
-  ].join('\n');
-
-  try {
-    fs.writeFileSync(UPDATE_INFO_FILE, payload, 'utf8');
-    try { fs.chmodSync(UPDATE_INFO_FILE, 0o644); } catch (_) {}
-    return {
-      ok: true,
-      path: UPDATE_INFO_FILE,
-      component: component || '-',
-      version: version || '-',
-      description: description || '-',
-      actor: actor || '-',
-      at_iso: iso,
-      at_local: local
-    };
-  } catch (err) {
-    return { ok: false, statusCode: 500, message: `gagal tulis update info: ${err.message}` };
-  }
-}
-
 function parseEnvLine(rawContent, key) {
   const content = String(rawContent || '');
   const re = new RegExp(`^${String(key).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=(.*)$`, 'm');
   const m = content.match(re);
   if (!m) return '';
   return String(m[1] || '').trim().replace(/^["']|["']$/g, '');
+}
+
+function applyScRegistrationMeta(payloadInput = {}) {
+  const payload = payloadInput && typeof payloadInput === 'object' ? payloadInput : {};
+  const clientName = sanitizeUpdateLine(payload.client_name || payload.client || '', 96);
+  const status = sanitizeUpdateLine(payload.status || 'active', 24).toLowerCase() || 'active';
+  const nowIso = new Date().toISOString();
+
+  let expiresAt = Number(payload.expires_at);
+  if (!Number.isFinite(expiresAt)) expiresAt = Number(payload.expired_at);
+  if (!Number.isFinite(expiresAt)) expiresAt = Number(payload.expiry);
+  if (!Number.isFinite(expiresAt)) expiresAt = 0;
+  expiresAt = Math.floor(Math.max(0, expiresAt));
+
+  const lines = [
+    `SC_STATUS=${status || 'active'}`,
+    `SC_CLIENT_NAME=${clientName || '-'}`,
+    `SC_EXPIRES_AT=${expiresAt}`,
+    `SC_UPDATED_AT_ISO=${nowIso}`,
+    ''
+  ].join('\n');
+
+  try {
+    const dir = require('path').dirname(SC_REG_META_FILE);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(SC_REG_META_FILE, lines, 'utf8');
+    try { fs.chmodSync(SC_REG_META_FILE, 0o644); } catch (_) {}
+    return { ok: true, path: SC_REG_META_FILE, status, client_name: clientName || '-', expires_at: expiresAt };
+  } catch (err) {
+    return { ok: false, statusCode: 500, message: `gagal tulis sc registration meta: ${err.message}` };
+  }
 }
 
 function readScTelegramConfig() {
@@ -1962,42 +1889,24 @@ app.post('/internal/sc-expired-notify', (req, res) => {
   });
 });
 
-app.post('/internal/trigger-update', (req, res) => {
-  const component = String(req.body?.component || 'both').trim().toLowerCase();
-  const releaseVersion = String(req.body?.release_version || '').trim();
-  const releaseDescription = String(req.body?.release_description || '').trim();
-  const releaseActor = String(req.body?.release_actor || '').trim();
+app.post('/internal/sc-registration-meta', (req, res) => {
   return authorizeAndRun(req, res, (db) => {
     db.close();
-    if (!['sc', 'api', 'both'].includes(component)) {
-      return res.status(400).json({ ok: false, message: 'component harus sc/api/both' });
+    const result = applyScRegistrationMeta(req.body || {});
+    if (!result.ok) {
+      return res.status(Number(result.statusCode || 500)).json(result);
     }
-
-    const result = { ok: true, component, steps: [] };
-    if (component === 'sc' || component === 'both') {
-      const scRes = triggerScAutoUpdate();
-      result.steps.push({ step: 'sc_update', ...scRes });
-      if (!scRes.ok) {
-        return res.status(Number(scRes.statusCode || 500)).json({ ok: false, message: scRes.message, result });
-      }
-    }
-    if (component === 'api' || component === 'both') {
-      const apiRes = restartCoreApiServices();
-      result.steps.push({ step: 'api_restart', ...apiRes });
-      if (!apiRes.ok) {
-        return res.status(Number(apiRes.statusCode || 500)).json({ ok: false, message: apiRes.message, result });
-      }
-    }
-    const releaseInfo = writeReleaseInfoFile(component, releaseVersion, releaseDescription, releaseActor);
-    if (!releaseInfo.ok) {
-      return res.status(Number(releaseInfo.statusCode || 500)).json({
-        ok: false,
-        message: releaseInfo.message || 'gagal tulis info update',
-        result
-      });
-    }
-    result.release_info = releaseInfo;
     return res.json(result);
+  });
+});
+
+app.post('/internal/trigger-update', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    return res.status(410).json({
+      ok: false,
+      message: 'endpoint trigger-update sudah dinonaktifkan permanen'
+    });
   });
 });
 
@@ -2030,7 +1939,7 @@ BANNER_TXT_FILE=/etc/sc-1forcr/banner.txt
 XRAY_CONFIG_FILE=/usr/local/etc/xray/config.json
 SC_ACCESS_LOCK_FILE=/etc/sc-1forcr-access.lock
 SC_RUNTIME_ENV_FILE=/etc/sc-1forcr.env
-UPDATE_INFO_FILE=/etc/sc-1forcr/update-info.env
+SC_REG_META_FILE=/etc/sc-1forcr-registration.env
 FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
 RESTORE_TMP_DIR=/tmp
 EOF
@@ -2125,9 +2034,6 @@ print_result() {
   echo
   echo "SC expired notify check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"ip\":\"1.2.3.4\",\"reason\":\"admin_remove_sc_ip\",\"actor\":\"123\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sc-expired-notify\" && echo"
-  echo
-  echo "Trigger update check:"
-  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"component\":\"both\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/trigger-update\" && echo"
   echo
   echo "Full restore from Telegram URL check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" \\"
