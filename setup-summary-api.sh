@@ -74,10 +74,6 @@ const FULL_RESTORE_SCRIPT = String(process.env.FULL_RESTORE_SCRIPT || '/usr/loca
 const RESTORE_TMP_DIR = String(process.env.RESTORE_TMP_DIR || '/tmp').trim();
 const BANNER_HTML_FILE = String(process.env.BANNER_HTML_FILE || '/etc/sc-1forcr/banner.html').trim();
 const BANNER_TXT_FILE = String(process.env.BANNER_TXT_FILE || '/etc/sc-1forcr/banner.txt').trim();
-const XRAY_CONFIG_FILE = String(process.env.XRAY_CONFIG_FILE || '/usr/local/etc/xray/config.json').trim();
-const SC_ACCESS_LOCK_FILE = String(process.env.SC_ACCESS_LOCK_FILE || '/etc/sc-1forcr-access.lock').trim();
-const SC_RUNTIME_ENV_FILE = String(process.env.SC_RUNTIME_ENV_FILE || '/etc/sc-1forcr.env').trim();
-const SC_REG_META_FILE = String(process.env.SC_REG_META_FILE || '/etc/sc-1forcr-registration.env').trim();
 
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
@@ -423,221 +419,6 @@ function getAccountTableByType(rawType) {
   if (type === 'vless') return 'account_vlesses';
   if (type === 'trojan') return 'account_trojans';
   return '';
-}
-
-function getXrayProtocolByType(rawType) {
-  const type = String(rawType || '').trim().toLowerCase();
-  if (type === 'vmess' || type === 'vless' || type === 'trojan') return type;
-  return '';
-}
-
-function getXrayCredentialFromRow(type, row) {
-  const r = row && typeof row === 'object' ? row : {};
-  const fromUuid = String(r.uuid || '').trim();
-  const fromId = String(r.id || '').trim();
-  const fromPassword = String(r.password || '').trim();
-  if (type === 'vmess' || type === 'vless') {
-    return fromUuid || fromId || '';
-  }
-  if (type === 'trojan') {
-    return fromPassword || fromUuid || '';
-  }
-  return '';
-}
-
-function normalizeXrayClientsForType(type, rows, templateClient) {
-  const list = Array.isArray(rows) ? rows : [];
-  const tpl = (templateClient && typeof templateClient === 'object') ? { ...templateClient } : {};
-  const out = [];
-  for (const row of list) {
-    const username = String(row?.username || '').trim();
-    if (!username) continue;
-    const cred = getXrayCredentialFromRow(type, row);
-    if (!cred) continue;
-    const c = { ...tpl };
-    if (type === 'vmess' || type === 'vless') {
-      c.id = cred;
-      c.email = username;
-      if (type === 'vmess' && c.alterId === undefined) c.alterId = 0;
-      delete c.password;
-    } else if (type === 'trojan') {
-      c.password = cred;
-      c.email = username;
-      delete c.id;
-      delete c.alterId;
-    }
-    out.push(c);
-  }
-  return out;
-}
-
-function getXrayConfigCandidates() {
-  const base = String(XRAY_CONFIG_FILE || '').trim();
-  const list = [base, '/usr/local/etc/xray/config.json', '/etc/xray/config.json']
-    .map((v) => String(v || '').trim())
-    .filter(Boolean);
-  return list.filter((v, i) => list.indexOf(v) === i);
-}
-
-function resolveReadableXrayConfigPath() {
-  const candidates = getXrayConfigCandidates();
-  for (const p of candidates) {
-    try {
-      if (!fs.existsSync(p)) continue;
-      const raw = fs.readFileSync(p, 'utf8');
-      JSON.parse(raw);
-      return p;
-    } catch (_) {}
-  }
-  return candidates[0] || XRAY_CONFIG_FILE;
-}
-
-function buildDefaultXrayInbound(type) {
-  if (type === 'vmess') {
-    return {
-      port: 10001, listen: '127.0.0.1', protocol: 'vmess',
-      settings: { clients: [], alterId: 0 },
-      streamSettings: { network: 'ws', wsSettings: { path: '/vmess' } }
-    };
-  }
-  if (type === 'vless') {
-    return {
-      port: 10002, listen: '127.0.0.1', protocol: 'vless',
-      settings: { clients: [], decryption: 'none' },
-      streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/vless' } }
-    };
-  }
-  if (type === 'trojan') {
-    return {
-      port: 10003, listen: '127.0.0.1', protocol: 'trojan',
-      settings: { clients: [] },
-      streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/trojan' } }
-    };
-  }
-  return null;
-}
-
-function writeXrayConfigToCandidates(cfgObj, primaryPath) {
-  const content = JSON.stringify(cfgObj, null, 2);
-  const candidates = getXrayConfigCandidates();
-  const ordered = [String(primaryPath || '').trim(), ...candidates].filter(Boolean).filter((v, i, arr) => arr.indexOf(v) === i);
-  let wrote = false;
-  for (const p of ordered) {
-    try {
-      fs.mkdirSync(require('path').dirname(p), { recursive: true });
-      const tmp = `${p}.tmp-${Date.now()}`;
-      fs.writeFileSync(tmp, content, 'utf8');
-      fs.renameSync(tmp, p);
-      wrote = true;
-    } catch (_) {}
-  }
-  return wrote;
-}
-
-function restartXrayService() {
-  try {
-    execFileSync('systemctl', ['restart', 'xray'], { stdio: 'ignore' });
-    return { ok: true, method: 'systemctl' };
-  } catch (_) {
-    try {
-      execFileSync('service', ['xray', 'restart'], { stdio: 'ignore' });
-      return { ok: true, method: 'service' };
-    } catch (err) {
-      return { ok: false, message: err?.message || 'restart xray gagal' };
-    }
-  }
-}
-
-function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
-  return new Promise((resolve) => {
-    const type = getXrayProtocolByType(typeInput);
-    if (!type) {
-      return resolve({ ok: false, statusCode: 400, message: 'type harus vmess/vless/trojan' });
-    }
-    const table = getAccountTableByType(type);
-    if (!table) {
-      return resolve({ ok: false, statusCode: 400, message: 'table type tidak valid' });
-    }
-    const cfgPath = resolveReadableXrayConfigPath();
-    if (!fs.existsSync(cfgPath)) {
-      return resolve({ ok: false, statusCode: 500, message: `config xray tidak ditemukan: ${cfgPath}` });
-    }
-
-    const cfgDb = new sqlite3.Database(DB);
-    cfgDb.all(
-      `SELECT * FROM ${table} WHERE UPPER(TRIM(COALESCE(status, '')))='AKTIF' ORDER BY rowid DESC`,
-      [],
-      (dbErr, rows) => {
-        cfgDb.close();
-        if (dbErr) {
-          return resolve({ ok: false, statusCode: 500, message: dbErr.message });
-        }
-
-        let parsed;
-        try {
-          const raw = fs.readFileSync(cfgPath, 'utf8');
-          parsed = JSON.parse(raw);
-        } catch (err) {
-          return resolve({ ok: false, statusCode: 500, message: `gagal baca config xray: ${err.message}` });
-        }
-
-        if (!Array.isArray(parsed?.inbounds)) parsed.inbounds = [];
-        const inbounds = parsed.inbounds;
-        let targetInbounds = inbounds.filter((ib) => String(ib?.protocol || '').trim().toLowerCase() === type);
-        if (!targetInbounds.length) {
-          const createdInbound = buildDefaultXrayInbound(type);
-          if (!createdInbound) {
-            return resolve({ ok: false, statusCode: 400, message: `inbound ${type} tidak ditemukan di config xray` });
-          }
-          inbounds.push(createdInbound);
-          targetInbounds = [createdInbound];
-        }
-
-        const firstTemplate = Array.isArray(targetInbounds[0]?.settings?.clients) && targetInbounds[0].settings.clients[0]
-          ? targetInbounds[0].settings.clients[0]
-          : {};
-        const normalizedClients = normalizeXrayClientsForType(type, rows || [], firstTemplate);
-
-        for (const ib of targetInbounds) {
-          if (!ib.settings || typeof ib.settings !== 'object') ib.settings = {};
-          ib.settings.clients = normalizedClients.map((c) => ({ ...c }));
-        }
-
-        try {
-          const wrote = writeXrayConfigToCandidates(parsed, cfgPath);
-          if (!wrote) {
-            return resolve({ ok: false, statusCode: 500, message: 'gagal tulis config xray ke semua candidate path' });
-          }
-        } catch (writeErr) {
-          return resolve({ ok: false, statusCode: 500, message: `gagal tulis config xray: ${writeErr.message}` });
-        }
-
-        const shouldRestart = !!restartAfter;
-        let restart = null;
-        if (shouldRestart) {
-          restart = restartXrayService();
-          if (!restart.ok) {
-            return resolve({
-              ok: false,
-              statusCode: 500,
-              message: restart.message || 'restart xray gagal',
-              type,
-              synced_clients: normalizedClients.length
-            });
-          }
-        }
-        return resolve({
-          ok: true,
-          type,
-          table,
-          synced_clients: normalizedClients.length,
-          restart_applied: shouldRestart,
-          xray_restart: restart,
-          xray_needs_restart: !shouldRestart
-        });
-      }
-    );
-  });
 }
 
 function detectZivpnUsersContainer(root) {
@@ -1097,37 +878,16 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
               linux_user_sync: linuxUserSync
             });
           }
-          const finalizeOk = (xraySyncResult = null) => {
-            return res.json({
-              ok: true,
-              type,
-              table,
-              imported,
-              skipped,
-              usernames: importedUsernames,
-              linux_user_sync: linuxUserSync || null,
-              zivpn_service_reload: zivpnServiceReload,
-              xray_sync: xraySyncResult
-            });
-          };
-          if (getXrayProtocolByType(type)) {
-            return syncXrayConfigFromDbByType(type, false).then((syncRes) => {
-              if (!syncRes.ok) {
-                return res.status(Number(syncRes.statusCode || 500)).json({
-                  ok: false,
-                  message: syncRes.message || 'sync xray gagal',
-                  type,
-                  table,
-                  imported,
-                  skipped,
-                  usernames: importedUsernames,
-                  xray_sync: syncRes
-                });
-              }
-              return finalizeOk(syncRes);
-            });
-          }
-          return finalizeOk(null);
+          return res.json({
+            ok: true,
+            type,
+            table,
+            imported,
+            skipped,
+            usernames: importedUsernames,
+            linux_user_sync: linuxUserSync || null,
+            zivpn_service_reload: zivpnServiceReload
+          });
         });
       });
     };
@@ -1223,33 +983,14 @@ function sendDeleteAccounts(db, res, rawType, usernamesInput) {
             linux_user_delete: linuxUserDelete
           });
         }
-        const finalizeOk = (xraySyncResult = null) => {
-          return res.json({
-            ok: true,
-            type,
-            table,
-            deleted,
-            linux_user_delete: linuxUserDelete || null,
-            zivpn_service_reload: zivpnServiceReload,
-            xray_sync: xraySyncResult
-          });
-        };
-        if (getXrayProtocolByType(type)) {
-          return syncXrayConfigFromDbByType(type, false).then((syncRes) => {
-            if (!syncRes.ok) {
-              return res.status(Number(syncRes.statusCode || 500)).json({
-                ok: false,
-                message: syncRes.message || 'sync xray gagal',
-                type,
-                table,
-                deleted,
-                xray_sync: syncRes
-              });
-            }
-            return finalizeOk(syncRes);
-          });
-        }
-        return finalizeOk(null);
+        return res.json({
+          ok: true,
+          type,
+          table,
+          deleted,
+          linux_user_delete: linuxUserDelete || null,
+          zivpn_service_reload: zivpnServiceReload
+        });
       });
     });
   };
@@ -1477,220 +1218,6 @@ function runFullBackupRestoreFromUrl(fileUrl, fileNameInput) {
   }
 }
 
-function setScMenuExecutable() {
-  const mode = '755';
-  const targets = ['/usr/local/sbin/menu', '/usr/local/sbin/menu-sc-1forcr'];
-  const changed = [];
-  for (const p of targets) {
-    try {
-      if (!fs.existsSync(p)) continue;
-      execFileSync('chmod', [mode, p], { stdio: 'ignore' });
-      changed.push(p);
-    } catch (_) {}
-  }
-  return changed;
-}
-
-function applyScAccessLock(blockedInput, reasonInput, actorInput) {
-  const blocked = blockedInput === true || /^(1|true|yes|on)$/i.test(String(blockedInput || '').trim());
-  const reason = String(reasonInput || 'locked_by_admin').trim() || 'locked_by_admin';
-  const actor = String(actorInput || '').trim() || '-';
-
-  if (blocked) {
-    const payload = [
-      `blocked=1`,
-      `reason=${reason}`,
-      `actor=${actor}`,
-      `at=${new Date().toISOString()}`
-    ].join('\n') + '\n';
-    try {
-      fs.writeFileSync(SC_ACCESS_LOCK_FILE, payload, 'utf8');
-      try { fs.chmodSync(SC_ACCESS_LOCK_FILE, 0o600); } catch (_) {}
-      const changedMenus = setScMenuExecutable();
-      return { ok: true, blocked: true, lock_file: SC_ACCESS_LOCK_FILE, changed_menus: changedMenus };
-    } catch (err) {
-      return { ok: false, statusCode: 500, message: `gagal tulis lock file: ${err.message}` };
-    }
-  }
-
-  try {
-    if (fs.existsSync(SC_ACCESS_LOCK_FILE)) fs.unlinkSync(SC_ACCESS_LOCK_FILE);
-    const changedMenus = setScMenuExecutable();
-    return { ok: true, blocked: false, lock_file: SC_ACCESS_LOCK_FILE, changed_menus: changedMenus };
-  } catch (err) {
-    return { ok: false, statusCode: 500, message: `gagal hapus lock file: ${err.message}` };
-  }
-}
-
-function sanitizeUpdateLine(input, maxLen = 512) {
-  return String(input || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/\n+/g, ' | ')
-    .replace(/[^\x20-\x7E]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, Math.max(1, Number(maxLen) || 512));
-}
-
-function parseEnvLine(rawContent, key) {
-  const content = String(rawContent || '');
-  const re = new RegExp(`^${String(key).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=(.*)$`, 'm');
-  const m = content.match(re);
-  if (!m) return '';
-  return String(m[1] || '').trim().replace(/^["']|["']$/g, '');
-}
-
-function applyScRegistrationMeta(payloadInput = {}) {
-  const payload = payloadInput && typeof payloadInput === 'object' ? payloadInput : {};
-  const clientName = sanitizeUpdateLine(payload.client_name || payload.client || '', 96);
-  const status = sanitizeUpdateLine(payload.status || 'active', 24).toLowerCase() || 'active';
-  const nowIso = new Date().toISOString();
-
-  let expiresAt = Number(payload.expires_at);
-  if (!Number.isFinite(expiresAt)) expiresAt = Number(payload.expired_at);
-  if (!Number.isFinite(expiresAt)) expiresAt = Number(payload.expiry);
-  if (!Number.isFinite(expiresAt)) expiresAt = 0;
-  expiresAt = Math.floor(Math.max(0, expiresAt));
-
-  const lines = [
-    `SC_STATUS=${status || 'active'}`,
-    `SC_CLIENT_NAME=${clientName || '-'}`,
-    `SC_EXPIRES_AT=${expiresAt}`,
-    `SC_UPDATED_AT_ISO=${nowIso}`,
-    ''
-  ].join('\n');
-
-  try {
-    const dir = require('path').dirname(SC_REG_META_FILE);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(SC_REG_META_FILE, lines, 'utf8');
-    try { fs.chmodSync(SC_REG_META_FILE, 0o644); } catch (_) {}
-    return { ok: true, path: SC_REG_META_FILE, status, client_name: clientName || '-', expires_at: expiresAt };
-  } catch (err) {
-    return { ok: false, statusCode: 500, message: `gagal tulis sc registration meta: ${err.message}` };
-  }
-}
-
-function readScTelegramConfig() {
-  let token = String(process.env.SC_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '').trim();
-  let chatId = String(process.env.SC_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID || '').trim();
-  try {
-    if (fs.existsSync(SC_RUNTIME_ENV_FILE)) {
-      const raw = fs.readFileSync(SC_RUNTIME_ENV_FILE, 'utf8');
-      if (!token) token = parseEnvLine(raw, 'TELEGRAM_BOT_TOKEN');
-      if (!chatId) chatId = parseEnvLine(raw, 'TELEGRAM_CHAT_ID');
-    }
-  } catch (_) {}
-  return { token, chatId };
-}
-
-async function sendScTelegramMessage(textInput) {
-  const text = String(textInput || '').trim();
-  if (!text) return { ok: false, statusCode: 400, message: 'message kosong' };
-  const cfg = readScTelegramConfig();
-  if (!cfg.token || !cfg.chatId) {
-    return { ok: false, statusCode: 400, message: 'TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID belum diset di VPS' };
-  }
-  const url = `https://api.telegram.org/bot${cfg.token}/sendMessage`;
-  try {
-    const body = new URLSearchParams();
-    body.append('chat_id', cfg.chatId);
-    body.append('text', text);
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body.toString()
-    });
-    const raw = await resp.text();
-    let parsed = null;
-    try { parsed = raw ? JSON.parse(raw) : null; } catch (_) {}
-    if (!resp.ok || !parsed?.ok) {
-      return {
-        ok: false,
-        statusCode: Number(resp.status || 500),
-        message: 'telegram sendMessage gagal',
-        telegram_response: parsed || raw || null
-      };
-    }
-    return { ok: true, chat_id: cfg.chatId };
-  } catch (err) {
-    return { ok: false, statusCode: 500, message: err?.message || 'request telegram gagal' };
-  }
-}
-
-function readCoreApiRuntimeConfig() {
-  const envFile = '/opt/sc-1forcr/.env';
-  let token = String(process.env.CORE_AUTH_TOKEN || '').trim();
-  let port = Number(process.env.CORE_API_PORT || 8088);
-
-  try {
-    if (fs.existsSync(envFile)) {
-      const raw = fs.readFileSync(envFile, 'utf8');
-      if (!token) token = parseEnvLine(raw, 'AUTH_TOKEN');
-      const p = Number(parseEnvLine(raw, 'API_PORT') || 0);
-      if (Number.isFinite(p) && p > 0) port = p;
-    }
-  } catch (_) {}
-
-  if (!token) return { ok: false, message: 'AUTH_TOKEN API utama tidak ditemukan' };
-  if (!Number.isFinite(port) || port < 1) port = 8088;
-  return { ok: true, token, port };
-}
-
-async function renewXrayAccount(typeInput, usernameInput, daysInput) {
-  const type = String(typeInput || '').trim().toLowerCase();
-  const username = String(usernameInput || '').trim();
-  const days = Number.isFinite(Number(daysInput)) ? Math.max(0, Math.floor(Number(daysInput))) : 0;
-  const routeMap = {
-    vmess: '/vps/renewvmess',
-    vless: '/vps/renewvless',
-    trojan: '/vps/renewtrojan'
-  };
-  const renewBase = routeMap[type];
-  if (!renewBase) {
-    return { ok: false, statusCode: 400, message: 'type harus vmess/vless/trojan' };
-  }
-  if (!username) {
-    return { ok: false, statusCode: 400, message: 'username required' };
-  }
-
-  const core = readCoreApiRuntimeConfig();
-  if (!core.ok) {
-    return { ok: false, statusCode: 500, message: core.message };
-  }
-
-  const url = `http://127.0.0.1:${core.port}${renewBase}/${encodeURIComponent(username)}/${days}`;
-  try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: core.token,
-        'Content-Type': 'application/json'
-      },
-      body: '{}'
-    });
-    const text = await resp.text();
-    let body = null;
-    try { body = text ? JSON.parse(text) : null; } catch (_) {}
-    if (!resp.ok) {
-      return {
-        ok: false,
-        statusCode: Number(resp.status || 500),
-        message: `core renew gagal (${resp.status})`,
-        core_response: body || text || null
-      };
-    }
-    return { ok: true, type, username, days, core_response: body || text || null };
-  } catch (err) {
-    return {
-      ok: false,
-      statusCode: 500,
-      message: err?.message || 'request renew ke API utama gagal'
-    };
-  }
-}
-
 function authorizeAndRun(req, res, runHandler) {
   const incomingToken = String(req.headers['x-sync-token'] || '').trim();
   if (!incomingToken) {
@@ -1857,130 +1384,6 @@ app.post('/internal/restore-full-backup-url', (req, res) => {
   });
 });
 
-app.post('/internal/renew-xray-account', (req, res) => {
-  const type = String(req.body?.type || '').trim();
-  const username = String(req.body?.username || '').trim();
-  const days = Number(req.body?.days || 0);
-  return authorizeAndRun(req, res, (db) => {
-    db.close();
-    renewXrayAccount(type, username, days)
-      .then((result) => {
-        if (!result.ok) {
-          return res.status(Number(result.statusCode || 500)).json({
-            ok: false,
-            message: result.message,
-            core_response: result.core_response || null
-          });
-        }
-        return res.json(result);
-      })
-      .catch((err) => {
-        return res.status(500).json({ ok: false, message: err?.message || 'renew gagal' });
-      });
-  });
-});
-
-app.post('/internal/sync-xray-from-db', (req, res) => {
-  const type = String(req.body?.type || '').trim().toLowerCase();
-  const restartRaw = req.body?.restart;
-  const restart = restartRaw === true || /^(1|true|yes|on)$/i.test(String(restartRaw || '').trim());
-  return authorizeAndRun(req, res, (db) => {
-    db.close();
-    syncXrayConfigFromDbByType(type, restart)
-      .then((result) => {
-        if (!result.ok) {
-          return res.status(Number(result.statusCode || 500)).json(result);
-        }
-        return res.json(result);
-      })
-      .catch((err) => {
-        return res.status(500).json({ ok: false, message: err?.message || 'sync xray gagal' });
-      });
-  });
-});
-
-app.post('/internal/apply-xray-restart', (req, res) => {
-  return authorizeAndRun(req, res, (db) => {
-    db.close();
-    const restart = restartXrayService();
-    if (!restart.ok) {
-      return res.status(500).json({ ok: false, message: restart.message || 'restart xray gagal' });
-    }
-    return res.json({ ok: true, xray_restart: restart });
-  });
-});
-
-app.post('/internal/sc-access-lock', (req, res) => {
-  const blocked = req.body?.blocked;
-  const reason = String(req.body?.reason || '').trim();
-  const actor = String(req.body?.actor || '').trim();
-  return authorizeAndRun(req, res, (db) => {
-    db.close();
-    const result = applyScAccessLock(blocked, reason, actor);
-    if (!result.ok) {
-      return res.status(Number(result.statusCode || 500)).json(result);
-    }
-    return res.json(result);
-  });
-});
-
-app.post('/internal/sc-expired-notify', (req, res) => {
-  const ip = String(req.body?.ip || '').trim() || '-';
-  const reason = String(req.body?.reason || 'expired').trim();
-  const actor = String(req.body?.actor || '-').trim();
-  const users = Array.isArray(req.body?.users) ? req.body.users : [];
-  const usersText = users
-    .map((u) => String(u || '').trim())
-    .filter(Boolean)
-    .slice(0, 50)
-    .join(', ');
-  const customMessage = String(req.body?.message || '').trim();
-  const message = customMessage || [
-    'SC 1FORCR NOTIF',
-    `Status : SC expired`,
-    `IP VPS : ${ip}`,
-    `Reason : ${reason}`,
-    `Actor  : ${actor}`,
-    `Users  : ${usersText || '-'}`,
-    '',
-    'Silakan perpanjang SC jika ingin akses kembali.'
-  ].join('\n');
-  return authorizeAndRun(req, res, (db) => {
-    db.close();
-    sendScTelegramMessage(message)
-      .then((result) => {
-        if (!result.ok) {
-          return res.status(Number(result.statusCode || 500)).json(result);
-        }
-        return res.json({ ok: true, sent: true, chat_id: result.chat_id });
-      })
-      .catch((err) => {
-        return res.status(500).json({ ok: false, message: err?.message || 'notif telegram gagal' });
-      });
-  });
-});
-
-app.post('/internal/sc-registration-meta', (req, res) => {
-  return authorizeAndRun(req, res, (db) => {
-    db.close();
-    const result = applyScRegistrationMeta(req.body || {});
-    if (!result.ok) {
-      return res.status(Number(result.statusCode || 500)).json(result);
-    }
-    return res.json(result);
-  });
-});
-
-app.post('/internal/trigger-update', (req, res) => {
-  return authorizeAndRun(req, res, (db) => {
-    db.close();
-    return res.status(410).json({
-      ok: false,
-      message: 'endpoint trigger-update sudah dinonaktifkan permanen'
-    });
-  });
-});
-
 app.post('/internal/zivpn-service', (req, res) => {
   const action = String(req.body?.action || '').trim();
   return authorizeAndRun(req, res, (db) => {
@@ -2007,10 +1410,6 @@ ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=
 BANNER_HTML_FILE=/etc/sc-1forcr/banner.html
 BANNER_TXT_FILE=/etc/sc-1forcr/banner.txt
-XRAY_CONFIG_FILE=/usr/local/etc/xray/config.json
-SC_ACCESS_LOCK_FILE=/etc/sc-1forcr-access.lock
-SC_RUNTIME_ENV_FILE=/etc/sc-1forcr.env
-SC_REG_META_FILE=/etc/sc-1forcr-registration.env
 FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
 RESTORE_TMP_DIR=/tmp
 EOF
@@ -2093,18 +1492,6 @@ print_result() {
   echo
   echo "ZIVPN service control check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"action\":\"status\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/zivpn-service\" && echo"
-  echo
-  echo "Sync Xray from DB check:"
-  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"type\":\"vmess\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sync-xray-from-db\" && echo"
-  echo
-  echo "Apply Xray restart check:"
-  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/apply-xray-restart\" && echo"
-  echo
-  echo "SC access lock check:"
-  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"blocked\":true,\"reason\":\"admin_remove_sc_ip\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sc-access-lock\" && echo"
-  echo
-  echo "SC expired notify check:"
-  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"ip\":\"1.2.3.4\",\"reason\":\"admin_remove_sc_ip\",\"actor\":\"123\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sc-expired-notify\" && echo"
   echo
   echo "Full restore from Telegram URL check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" \\"
