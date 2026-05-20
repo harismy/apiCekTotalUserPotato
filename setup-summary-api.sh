@@ -5,6 +5,7 @@ APP_DIR="${APP_DIR:-/root/tunnel-sync}"
 APP_NAME="${APP_NAME:-tunnel-summary}"
 SUMMARY_PORT="${SUMMARY_PORT:-8789}"
 POTATO_DB="${POTATO_DB:-/usr/sbin/potatonc/potato.db}"
+SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root (or use sudo)."
@@ -68,12 +69,79 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 const PORT = Number(process.env.SUMMARY_PORT || 8789);
 const DB = process.env.POTATO_DB || '/usr/sbin/potatonc/potato.db';
+const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
 const USE_DB_AUTH = String(process.env.USE_DB_AUTH || '1') !== '0';
 const STATIC_TOKEN = (process.env.SYNC_TOKEN || '').trim();
 const FULL_RESTORE_SCRIPT = String(process.env.FULL_RESTORE_SCRIPT || '/usr/local/sbin/sc-1forcr-restore-backup').trim();
 const RESTORE_TMP_DIR = String(process.env.RESTORE_TMP_DIR || '/tmp').trim();
 const BANNER_HTML_FILE = String(process.env.BANNER_HTML_FILE || '/etc/sc-1forcr/banner.html').trim();
 const BANNER_TXT_FILE = String(process.env.BANNER_TXT_FILE || '/etc/sc-1forcr/banner.txt').trim();
+const XRAY_CONFIG_FILE = String(process.env.XRAY_CONFIG_FILE || '/usr/local/etc/xray/config.json').trim();
+const SC_ACCESS_LOCK_FILE = String(process.env.SC_ACCESS_LOCK_FILE || '/etc/sc-1forcr-access.lock').trim();
+const SC_RUNTIME_ENV_FILE = String(process.env.SC_RUNTIME_ENV_FILE || '/etc/sc-1forcr.env').trim();
+const SC_REG_META_FILE = String(process.env.SC_REG_META_FILE || '/etc/sc-1forcr-registration.env').trim();
+const SC_APP_ENV_FILE = String(process.env.SC_APP_ENV_FILE || '/opt/sc-1forcr/.env').trim();
+const RUNTIME_SETTINGS_KEYS = Object.freeze([
+  'AUTO_BACKUP_ENABLE',
+  'AUTO_BACKUP_DIR',
+  'AUTO_BACKUP_KEEP_DAYS',
+  'AUTO_BACKUP_INTERVAL_MINUTES',
+  'AUTO_BACKUP_SCHEDULE_MODE',
+  'AUTO_BACKUP_WIB_HOUR',
+  'AUTO_REBOOT_ENABLE',
+  'AUTO_REBOOT_INTERVAL_MINUTES',
+  'AUTO_PULL_UPDATE_ENABLE',
+  'AUTO_PULL_UPDATE_INTERVAL_MINUTES',
+  'ONLINE_NOTIFY_ENABLE',
+  'ONLINE_NOTIFY_INTERVAL_HOURS',
+  'ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS',
+  'IPLIMIT_CHECK_INTERVAL_MINUTES',
+  'IPLIMIT_LOCK_MINUTES',
+  'IPLIMIT_AUTO_LOCK_ENABLE',
+  'IPLIMIT_AUTO_TUNE',
+  'IPLIMIT_DEBUG',
+  'DROPBEAR_LOG_MAX_LINES',
+  'DROPBEAR_RECENT_LOG_MAX_LINES',
+  'UDPHC_LOG_LINES_HISTORY',
+  'UDPHC_LOG_LINES_REALTIME',
+  'UDPHC_LOG_LINES_CHECKER',
+  'XRAY_BLOCK_TCP_PORTS',
+  'XRAY_RECENT_WINDOW_MINUTES',
+  'XRAY_ACTIVE_WINDOW_SECONDS',
+  'XRAY_MIN_HITS_PER_IP',
+  'XRAY_PATHS_VMESS',
+  'XRAY_PATHS_VLESS',
+  'XRAY_PATHS_TROJAN',
+  'VMESS_BUG_PROFILE_ADDRESS',
+  'VMESS_BUG_PROFILE_SNI',
+  'VMESS_BUG_PROFILE_HOST',
+  'VMESS_BUG_PROFILE_ALLOW_INSECURE',
+  'ZIVPN_ACTIVE_WINDOW_SECONDS',
+  'ZIVPN_HANDOFF_GRACE_SECONDS',
+  'ZIVPN_LIVE_TTL_SECONDS',
+  'ZIVPN_AUTH_APPLY_MODE',
+  'ZIVPN_AUTH_MODE',
+  'ZIVPN_RELOAD_ON_AUTH_CHANGE',
+  'ACTIVE_UDP_BACKEND',
+  'SSH_HC_AUTH_LOOKBACK_HOURS',
+  'SSHWS_UDPGW_PORTS',
+  'SSH_TUNNEL_SHELL',
+  'SSH_TUNNEL_BLOCK_OUTBOUND_SSH',
+  'SSH_TUNNEL_BLOCK_OUTBOUND_PORTS',
+  'SSHWS_LOOP_GUARD_ENABLE',
+  'SSHWS_LOOP_GUARD_PORTS',
+  'SSHWS_LOOP_GUARD_NEW_ABOVE',
+  'SSHWS_LOOP_GUARD_BURST',
+  'SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE',
+  'SSHWS_NGINX_LIMIT_ENABLE',
+  'SSHWS_NGINX_LIMIT_RATE',
+  'SSHWS_NGINX_LIMIT_BURST',
+  'SSHWS_NGINX_LIMIT_CONN',
+  'NGINX_WORKER_CONNECTIONS',
+  'NGINX_WORKER_RLIMIT_NOFILE',
+  'NGINX_SERVICE_LIMIT_NOFILE'
+]);
+const RUNTIME_SETTINGS_KEY_SET = new Set(RUNTIME_SETTINGS_KEYS);
 
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
@@ -197,8 +265,35 @@ function isValidUnixUsername(username) {
   return /^[a-z0-9][a-z0-9_-]{2,31}$/.test(String(username || '').trim());
 }
 
+function resolveTunnelShell() {
+  const choices = [SSH_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+  for (const shell of choices) {
+    try {
+      if (fs.existsSync(shell)) return shell;
+    } catch (_) {}
+  }
+  return '/usr/sbin/nologin';
+}
+
+function ensureTunnelShellAllowed() {
+  const shell = resolveTunnelShell();
+  try {
+    const shellsFile = '/etc/shells';
+    const current = fs.existsSync(shellsFile) ? fs.readFileSync(shellsFile, 'utf8') : '';
+    const exists = current.split(/\r?\n/).map((line) => line.trim()).includes(shell);
+    if (!exists) {
+      const prefix = current && !current.endsWith('\n') ? '\n' : '';
+      fs.appendFileSync(shellsFile, `${prefix}${shell}\n`);
+    }
+  } catch (_) {}
+  return shell;
+}
+
 function syncSshLinuxUsers(accounts) {
   const rows = Array.isArray(accounts) ? accounts : [];
+  const tunnelShell = ensureTunnelShellAllowed();
   let created = 0;
   let updated = 0;
   let skipped = 0;
@@ -225,7 +320,7 @@ function syncSshLinuxUsers(accounts) {
       }
 
       if (!exists) {
-        execFileSync('useradd', ['-m', '-d', homeDir, '-s', '/bin/bash', username], { stdio: 'ignore' });
+        execFileSync('useradd', ['-m', '-d', homeDir, '-s', tunnelShell, username], { stdio: 'ignore' });
         created += 1;
       } else {
         updated += 1;
@@ -233,7 +328,7 @@ function syncSshLinuxUsers(accounts) {
 
       try { fs.mkdirSync(homeDir, { recursive: true }); } catch (_) {}
       execFileSync('chown', ['-R', `${username}:${username}`, homeDir], { stdio: 'ignore' });
-      execFileSync('usermod', ['-d', homeDir, '-s', '/bin/bash', username], { stdio: 'ignore' });
+      execFileSync('usermod', ['-d', homeDir, '-s', tunnelShell, username], { stdio: 'ignore' });
       execFileSync('chpasswd', [], { input: `${username}:${password}\n` });
 
       if (/^\d{4}-\d{2}-\d{2}$/.test(dateExp)) {
@@ -419,6 +514,221 @@ function getAccountTableByType(rawType) {
   if (type === 'vless') return 'account_vlesses';
   if (type === 'trojan') return 'account_trojans';
   return '';
+}
+
+function getXrayProtocolByType(rawType) {
+  const type = String(rawType || '').trim().toLowerCase();
+  if (type === 'vmess' || type === 'vless' || type === 'trojan') return type;
+  return '';
+}
+
+function getXrayCredentialFromRow(type, row) {
+  const r = row && typeof row === 'object' ? row : {};
+  const fromUuid = String(r.uuid || '').trim();
+  const fromId = String(r.id || '').trim();
+  const fromPassword = String(r.password || '').trim();
+  if (type === 'vmess' || type === 'vless') {
+    return fromUuid || fromId || '';
+  }
+  if (type === 'trojan') {
+    return fromPassword || fromUuid || '';
+  }
+  return '';
+}
+
+function normalizeXrayClientsForType(type, rows, templateClient) {
+  const list = Array.isArray(rows) ? rows : [];
+  const tpl = (templateClient && typeof templateClient === 'object') ? { ...templateClient } : {};
+  const out = [];
+  for (const row of list) {
+    const username = String(row?.username || '').trim();
+    if (!username) continue;
+    const cred = getXrayCredentialFromRow(type, row);
+    if (!cred) continue;
+    const c = { ...tpl };
+    if (type === 'vmess' || type === 'vless') {
+      c.id = cred;
+      c.email = username;
+      if (type === 'vmess' && c.alterId === undefined) c.alterId = 0;
+      delete c.password;
+    } else if (type === 'trojan') {
+      c.password = cred;
+      c.email = username;
+      delete c.id;
+      delete c.alterId;
+    }
+    out.push(c);
+  }
+  return out;
+}
+
+function getXrayConfigCandidates() {
+  const base = String(XRAY_CONFIG_FILE || '').trim();
+  const list = [base, '/usr/local/etc/xray/config.json', '/etc/xray/config.json']
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+  return list.filter((v, i) => list.indexOf(v) === i);
+}
+
+function resolveReadableXrayConfigPath() {
+  const candidates = getXrayConfigCandidates();
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const raw = fs.readFileSync(p, 'utf8');
+      JSON.parse(raw);
+      return p;
+    } catch (_) {}
+  }
+  return candidates[0] || XRAY_CONFIG_FILE;
+}
+
+function buildDefaultXrayInbound(type) {
+  if (type === 'vmess') {
+    return {
+      port: 10001, listen: '127.0.0.1', protocol: 'vmess',
+      settings: { clients: [], alterId: 0 },
+      streamSettings: { network: 'ws', wsSettings: { path: '/vmess' } }
+    };
+  }
+  if (type === 'vless') {
+    return {
+      port: 10002, listen: '127.0.0.1', protocol: 'vless',
+      settings: { clients: [], decryption: 'none' },
+      streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/vless' } }
+    };
+  }
+  if (type === 'trojan') {
+    return {
+      port: 10003, listen: '127.0.0.1', protocol: 'trojan',
+      settings: { clients: [] },
+      streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/trojan' } }
+    };
+  }
+  return null;
+}
+
+function writeXrayConfigToCandidates(cfgObj, primaryPath) {
+  const content = JSON.stringify(cfgObj, null, 2);
+  const candidates = getXrayConfigCandidates();
+  const ordered = [String(primaryPath || '').trim(), ...candidates].filter(Boolean).filter((v, i, arr) => arr.indexOf(v) === i);
+  let wrote = false;
+  for (const p of ordered) {
+    try {
+      fs.mkdirSync(require('path').dirname(p), { recursive: true });
+      const tmp = `${p}.tmp-${Date.now()}`;
+      fs.writeFileSync(tmp, content, 'utf8');
+      fs.renameSync(tmp, p);
+      wrote = true;
+    } catch (_) {}
+  }
+  return wrote;
+}
+
+function restartXrayService() {
+  try {
+    execFileSync('systemctl', ['restart', 'xray'], { stdio: 'ignore' });
+    return { ok: true, method: 'systemctl' };
+  } catch (_) {
+    try {
+      execFileSync('service', ['xray', 'restart'], { stdio: 'ignore' });
+      return { ok: true, method: 'service' };
+    } catch (err) {
+      return { ok: false, message: err?.message || 'restart xray gagal' };
+    }
+  }
+}
+
+function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
+  return new Promise((resolve) => {
+    const type = getXrayProtocolByType(typeInput);
+    if (!type) {
+      return resolve({ ok: false, statusCode: 400, message: 'type harus vmess/vless/trojan' });
+    }
+    const table = getAccountTableByType(type);
+    if (!table) {
+      return resolve({ ok: false, statusCode: 400, message: 'table type tidak valid' });
+    }
+    const cfgPath = resolveReadableXrayConfigPath();
+    if (!fs.existsSync(cfgPath)) {
+      return resolve({ ok: false, statusCode: 500, message: `config xray tidak ditemukan: ${cfgPath}` });
+    }
+
+    const cfgDb = new sqlite3.Database(DB);
+    cfgDb.all(
+      `SELECT * FROM ${table} WHERE UPPER(TRIM(COALESCE(status, '')))='AKTIF' ORDER BY rowid DESC`,
+      [],
+      (dbErr, rows) => {
+        cfgDb.close();
+        if (dbErr) {
+          return resolve({ ok: false, statusCode: 500, message: dbErr.message });
+        }
+
+        let parsed;
+        try {
+          const raw = fs.readFileSync(cfgPath, 'utf8');
+          parsed = JSON.parse(raw);
+        } catch (err) {
+          return resolve({ ok: false, statusCode: 500, message: `gagal baca config xray: ${err.message}` });
+        }
+
+        if (!Array.isArray(parsed?.inbounds)) parsed.inbounds = [];
+        const inbounds = parsed.inbounds;
+        let targetInbounds = inbounds.filter((ib) => String(ib?.protocol || '').trim().toLowerCase() === type);
+        if (!targetInbounds.length) {
+          const createdInbound = buildDefaultXrayInbound(type);
+          if (!createdInbound) {
+            return resolve({ ok: false, statusCode: 400, message: `inbound ${type} tidak ditemukan di config xray` });
+          }
+          inbounds.push(createdInbound);
+          targetInbounds = [createdInbound];
+        }
+
+        const firstTemplate = Array.isArray(targetInbounds[0]?.settings?.clients) && targetInbounds[0].settings.clients[0]
+          ? targetInbounds[0].settings.clients[0]
+          : {};
+        const normalizedClients = normalizeXrayClientsForType(type, rows || [], firstTemplate);
+
+        for (const ib of targetInbounds) {
+          if (!ib.settings || typeof ib.settings !== 'object') ib.settings = {};
+          ib.settings.clients = normalizedClients.map((c) => ({ ...c }));
+        }
+
+        try {
+          const wrote = writeXrayConfigToCandidates(parsed, cfgPath);
+          if (!wrote) {
+            return resolve({ ok: false, statusCode: 500, message: 'gagal tulis config xray ke semua candidate path' });
+          }
+        } catch (writeErr) {
+          return resolve({ ok: false, statusCode: 500, message: `gagal tulis config xray: ${writeErr.message}` });
+        }
+
+        const shouldRestart = !!restartAfter;
+        let restart = null;
+        if (shouldRestart) {
+          restart = restartXrayService();
+          if (!restart.ok) {
+            return resolve({
+              ok: false,
+              statusCode: 500,
+              message: restart.message || 'restart xray gagal',
+              type,
+              synced_clients: normalizedClients.length
+            });
+          }
+        }
+        return resolve({
+          ok: true,
+          type,
+          table,
+          synced_clients: normalizedClients.length,
+          restart_applied: shouldRestart,
+          xray_restart: restart,
+          xray_needs_restart: !shouldRestart
+        });
+      }
+    );
+  });
 }
 
 function detectZivpnUsersContainer(root) {
@@ -777,6 +1087,336 @@ function restoreBannerConfig(payload) {
   };
 }
 
+function unquoteEnvValue(valueInput) {
+  let value = String(valueInput || '').trim();
+  if (value.length >= 2 && value[0] === value[value.length - 1] && (value[0] === '"' || value[0] === "'")) {
+    value = value.slice(1, -1);
+  }
+  return value;
+}
+
+function readRuntimeSettingsFromFile(filePath) {
+  const settings = {};
+  if (!filePath) return settings;
+  try {
+    if (!fs.existsSync(filePath)) return settings;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = String(line || '').trim();
+      if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) continue;
+      const idx = trimmed.indexOf('=');
+      const key = trimmed.slice(0, idx).trim();
+      if (!RUNTIME_SETTINGS_KEY_SET.has(key)) continue;
+      settings[key] = unquoteEnvValue(trimmed.slice(idx + 1));
+    }
+  } catch (_) {}
+  return settings;
+}
+
+function readRuntimeSettings() {
+  return {
+    ...readRuntimeSettingsFromFile(SC_APP_ENV_FILE),
+    ...readRuntimeSettingsFromFile(SC_RUNTIME_ENV_FILE)
+  };
+}
+
+function cleanRuntimeSettingValue(valueInput) {
+  return String(valueInput ?? '').replace(/\r/g, '').replace(/\n/g, '').trim().slice(0, 512);
+}
+
+function filterRuntimeSettings(settingsInput) {
+  const input = settingsInput && typeof settingsInput === 'object' ? settingsInput : {};
+  const out = {};
+  for (const key of RUNTIME_SETTINGS_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(input, key)) continue;
+    out[key] = cleanRuntimeSettingValue(input[key]);
+  }
+  return out;
+}
+
+function quoteEnvValue(valueInput) {
+  const value = String(valueInput ?? '');
+  if (/^[A-Za-z0-9_@%+=:,./-]*$/.test(value)) return value || "''";
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+function writeRuntimeSettingsFile(filePath, settings) {
+  if (!filePath || !settings || typeof settings !== 'object') return 0;
+  const keys = Object.keys(settings).filter((key) => RUNTIME_SETTINGS_KEY_SET.has(key));
+  if (keys.length === 0) return 0;
+
+  let lines = [];
+  try {
+    if (fs.existsSync(filePath)) lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
+  } catch (_) {
+    lines = [];
+  }
+
+  const seen = new Set();
+  const out = [];
+  for (const line of lines) {
+    if (!line) continue;
+    const trimmed = String(line || '').trim();
+    if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) {
+      out.push(line);
+      continue;
+    }
+    const key = trimmed.slice(0, trimmed.indexOf('=')).trim();
+    if (RUNTIME_SETTINGS_KEY_SET.has(key) && Object.prototype.hasOwnProperty.call(settings, key)) {
+      out.push(`${key}=${quoteEnvValue(settings[key])}`);
+      seen.add(key);
+      continue;
+    }
+    out.push(line);
+  }
+
+  for (const key of RUNTIME_SETTINGS_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(settings, key) || seen.has(key)) continue;
+    out.push(`${key}=${quoteEnvValue(settings[key])}`);
+  }
+
+  try {
+    const dir = require('path').dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(filePath, `${out.join('\n').replace(/\n+$/g, '')}\n`, 'utf8');
+    if (filePath === SC_RUNTIME_ENV_FILE) {
+      try { fs.chmodSync(filePath, 0o600); } catch (_) {}
+    }
+  } catch (err) {
+    throw new Error(`gagal tulis ${filePath}: ${err.message}`);
+  }
+  return keys.length;
+}
+
+function intSetting(settings, key, fallback, min, max) {
+  const n = Number(String(settings?.[key] ?? '').replace(/[^0-9]/g, ''));
+  if (!Number.isFinite(n) || n < min || n > max) return fallback;
+  return Math.floor(n);
+}
+
+function enabledSetting(settings, key, fallback = '1') {
+  const value = String(settings?.[key] ?? fallback).trim().toLowerCase();
+  return /^(0|off|false|no|nonaktif)$/.test(value) ? '0' : '1';
+}
+
+function runSystemctl(args) {
+  try {
+    execFileSync('systemctl', args, { stdio: 'ignore' });
+    return { ok: true, command: `systemctl ${args.join(' ')}` };
+  } catch (err) {
+    return { ok: false, command: `systemctl ${args.join(' ')}`, message: err?.message || 'systemctl gagal' };
+  }
+}
+
+function writeIpLimitTimerUnit(intervalMinutes) {
+  fs.writeFileSync('/etc/systemd/system/sc-1forcr-iplimit.timer', `[Unit]
+Description=Run SC 1FORCR IP Limit Checker every ${intervalMinutes} minutes
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=${intervalMinutes}min
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-iplimit.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+}
+
+function writeAutoBackupTimerUnit(settings) {
+  if (!fs.existsSync('/etc/systemd/system/sc-1forcr-autobackup.service')) return false;
+  const modeRaw = String(settings.AUTO_BACKUP_SCHEDULE_MODE || 'interval').trim().toLowerCase();
+  const mode = /^(daily|daily_wib|wib)$/.test(modeRaw) ? 'daily_wib' : 'interval';
+  const interval = intSetting(settings, 'AUTO_BACKUP_INTERVAL_MINUTES', 1440, 1, 10080);
+  const hour = intSetting(settings, 'AUTO_BACKUP_WIB_HOUR', 2, 0, 23);
+  if (mode === 'daily_wib') {
+    fs.writeFileSync('/etc/systemd/system/sc-1forcr-autobackup.timer', `[Unit]
+Description=Run SC 1FORCR auto backup daily at ${String(hour).padStart(2, '0')}:00 WIB
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+    return true;
+  }
+  fs.writeFileSync('/etc/systemd/system/sc-1forcr-autobackup.timer', `[Unit]
+Description=Run SC 1FORCR auto backup every ${interval} minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=${interval}min
+AccuracySec=1s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+  return true;
+}
+
+function writeAutoRebootTimerUnit(settings) {
+  if (!fs.existsSync('/etc/systemd/system/sc-1forcr-autoreboot.service')) return false;
+  const interval = intSetting(settings, 'AUTO_REBOOT_INTERVAL_MINUTES', 1440, 30, 10080);
+  fs.writeFileSync('/etc/systemd/system/sc-1forcr-autoreboot.timer', `[Unit]
+Description=Run SC 1FORCR auto reboot every ${interval} minutes
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=${interval}min
+Persistent=true
+AccuracySec=1min
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+  return true;
+}
+
+function writePullUpdateTimerUnit(settings) {
+  if (!fs.existsSync('/etc/systemd/system/sc-1forcr-pull-update.service')) return false;
+  const interval = intSetting(settings, 'AUTO_PULL_UPDATE_INTERVAL_MINUTES', 10, 1, 1440);
+  fs.writeFileSync('/etc/systemd/system/sc-1forcr-pull-update.timer', `[Unit]
+Description=Check SC 1FORCR update trigger every ${interval} minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=${interval}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-pull-update.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+  return true;
+}
+
+function writeOnlineNotifyTimerUnit(settings) {
+  if (!fs.existsSync('/etc/systemd/system/sc-1forcr-online-notify.service')) return false;
+  const interval = intSetting(settings, 'ONLINE_NOTIFY_INTERVAL_HOURS', 3, 1, 168);
+  fs.writeFileSync('/etc/systemd/system/sc-1forcr-online-notify.timer', `[Unit]
+Description=Run SC 1FORCR online account notifier every ${interval} hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${interval}h
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-online-notify.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+  return true;
+}
+
+function applyRuntimeSettingsUnits(settings) {
+  const actions = [];
+  writeIpLimitTimerUnit(intSetting(settings, 'IPLIMIT_CHECK_INTERVAL_MINUTES', 1, 1, 1440));
+  const hasAutoBackupTimer = writeAutoBackupTimerUnit(settings);
+  const hasAutoRebootTimer = writeAutoRebootTimerUnit(settings);
+  const hasPullUpdateTimer = writePullUpdateTimerUnit(settings);
+  const hasOnlineNotifyTimer = writeOnlineNotifyTimerUnit(settings);
+
+  actions.push(runSystemctl(['daemon-reload']));
+  actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-iplimit.timer']));
+  actions.push(runSystemctl(['restart', 'sc-1forcr-iplimit.timer']));
+  actions.push(runSystemctl(['start', 'sc-1forcr-iplimit.service']));
+
+  if (hasAutoBackupTimer) {
+    if (enabledSetting(settings, 'AUTO_BACKUP_ENABLE', '1') === '1') {
+      actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-autobackup.timer']));
+      actions.push(runSystemctl(['restart', 'sc-1forcr-autobackup.timer']));
+    } else {
+      actions.push(runSystemctl(['disable', '--now', 'sc-1forcr-autobackup.timer']));
+    }
+  }
+
+  if (hasAutoRebootTimer) {
+    if (enabledSetting(settings, 'AUTO_REBOOT_ENABLE', '1') === '1') {
+      actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-autoreboot.timer']));
+      actions.push(runSystemctl(['restart', 'sc-1forcr-autoreboot.timer']));
+    } else {
+      actions.push(runSystemctl(['disable', '--now', 'sc-1forcr-autoreboot.timer']));
+    }
+  }
+
+  if (hasPullUpdateTimer) {
+    if (enabledSetting(settings, 'AUTO_PULL_UPDATE_ENABLE', '1') === '1') {
+      actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-pull-update.timer']));
+      actions.push(runSystemctl(['restart', 'sc-1forcr-pull-update.timer']));
+    } else {
+      actions.push(runSystemctl(['disable', '--now', 'sc-1forcr-pull-update.timer']));
+    }
+  }
+
+  if (hasOnlineNotifyTimer) {
+    if (enabledSetting(settings, 'ONLINE_NOTIFY_ENABLE', '1') === '1') {
+      actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-online-notify.timer']));
+      actions.push(runSystemctl(['restart', 'sc-1forcr-online-notify.timer']));
+    } else {
+      actions.push(runSystemctl(['disable', '--now', 'sc-1forcr-online-notify.timer']));
+    }
+  }
+
+  return actions;
+}
+
+function sendExportRuntimeSettings(res) {
+  try {
+    const settings = readRuntimeSettings();
+    return res.json({
+      ok: true,
+      settings,
+      total_settings: Object.keys(settings).length,
+      runtime_env_path: SC_RUNTIME_ENV_FILE,
+      app_env_path: SC_APP_ENV_FILE
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: `gagal export settings: ${err.message}` });
+  }
+}
+
+function restoreRuntimeSettings(settingsInput) {
+  const settings = filterRuntimeSettings(settingsInput);
+  const total = Object.keys(settings).length;
+  if (total === 0) {
+    return { ok: false, message: 'settings valid tidak ditemukan' };
+  }
+
+  writeRuntimeSettingsFile(SC_RUNTIME_ENV_FILE, settings);
+  if (fs.existsSync(SC_APP_ENV_FILE)) {
+    writeRuntimeSettingsFile(SC_APP_ENV_FILE, settings);
+  }
+
+  const effectiveSettings = {
+    ...readRuntimeSettings(),
+    ...settings
+  };
+  const unitActions = applyRuntimeSettingsUnits(effectiveSettings);
+  const apiRestart = runSystemctl(['restart', 'sc-1forcr-api']);
+
+  return {
+    ok: true,
+    restored_settings: total,
+    settings,
+    unit_actions: unitActions,
+    api_restart: apiRestart
+  };
+}
+
 function sendExportAccounts(db, res, rawType, rawLimit) {
   const type = String(rawType || '').trim().toLowerCase();
   const table = getAccountTableByType(type);
@@ -829,7 +1469,27 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
       return res.status(500).json({ ok: false, message: `kolom username tidak ada di ${table}` });
     }
 
-    const insertCols = columns.filter((col) => accounts.some((row) => Object.prototype.hasOwnProperty.call(row || {}, col)));
+    const importRows = (Array.isArray(accounts) ? accounts : []).map((raw) => ({ ...(raw || {}) }));
+
+    // Kompatibilitas backup lintas script:
+    // - Beberapa backup (mis. potato) mengirim trojan credential di field "uuid"
+    // - DB 1FORCR menyimpan trojan credential di kolom "password"
+    if (type === 'trojan') {
+      for (const r of importRows) {
+        const pass = String(r.password || '').trim();
+        const uid = String(r.uuid || r.id || r.secret || '').trim();
+        if (!pass && uid) r.password = uid;
+      }
+    }
+
+    // Kompatibilitas nama field limit IP lintas source.
+    for (const r of importRows) {
+      if ((r.limitip === undefined || r.limitip === null || r.limitip === '') && r.limit_ip !== undefined && r.limit_ip !== null) {
+        r.limitip = r.limit_ip;
+      }
+    }
+
+    const insertCols = columns.filter((col) => importRows.some((row) => Object.prototype.hasOwnProperty.call(row || {}, col)));
     if (!insertCols.includes('username')) insertCols.unshift('username');
 
     const placeholders = insertCols.map(() => '?').join(',');
@@ -878,16 +1538,37 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
               linux_user_sync: linuxUserSync
             });
           }
-          return res.json({
-            ok: true,
-            type,
-            table,
-            imported,
-            skipped,
-            usernames: importedUsernames,
-            linux_user_sync: linuxUserSync || null,
-            zivpn_service_reload: zivpnServiceReload
-          });
+          const finalizeOk = (xraySyncResult = null) => {
+            return res.json({
+              ok: true,
+              type,
+              table,
+              imported,
+              skipped,
+              usernames: importedUsernames,
+              linux_user_sync: linuxUserSync || null,
+              zivpn_service_reload: zivpnServiceReload,
+              xray_sync: xraySyncResult
+            });
+          };
+          if (getXrayProtocolByType(type)) {
+            return syncXrayConfigFromDbByType(type, false).then((syncRes) => {
+              if (!syncRes.ok) {
+                return res.status(Number(syncRes.statusCode || 500)).json({
+                  ok: false,
+                  message: syncRes.message || 'sync xray gagal',
+                  type,
+                  table,
+                  imported,
+                  skipped,
+                  usernames: importedUsernames,
+                  xray_sync: syncRes
+                });
+              }
+              return finalizeOk(syncRes);
+            });
+          }
+          return finalizeOk(null);
         });
       });
     };
@@ -898,7 +1579,7 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
         return res.status(500).json({ ok: false, message: beginErr.message });
       }
 
-      for (const row of accounts) {
+      for (const row of importRows) {
         const username = String(row?.username || '').trim();
         if (!username) {
           skipped += 1;
@@ -983,14 +1664,33 @@ function sendDeleteAccounts(db, res, rawType, usernamesInput) {
             linux_user_delete: linuxUserDelete
           });
         }
-        return res.json({
-          ok: true,
-          type,
-          table,
-          deleted,
-          linux_user_delete: linuxUserDelete || null,
-          zivpn_service_reload: zivpnServiceReload
-        });
+        const finalizeOk = (xraySyncResult = null) => {
+          return res.json({
+            ok: true,
+            type,
+            table,
+            deleted,
+            linux_user_delete: linuxUserDelete || null,
+            zivpn_service_reload: zivpnServiceReload,
+            xray_sync: xraySyncResult
+          });
+        };
+        if (getXrayProtocolByType(type)) {
+          return syncXrayConfigFromDbByType(type, false).then((syncRes) => {
+            if (!syncRes.ok) {
+              return res.status(Number(syncRes.statusCode || 500)).json({
+                ok: false,
+                message: syncRes.message || 'sync xray gagal',
+                type,
+                table,
+                deleted,
+                xray_sync: syncRes
+              });
+            }
+            return finalizeOk(syncRes);
+          });
+        }
+        return finalizeOk(null);
       });
     });
   };
@@ -1218,6 +1918,220 @@ function runFullBackupRestoreFromUrl(fileUrl, fileNameInput) {
   }
 }
 
+function setScMenuExecutable() {
+  const mode = '755';
+  const targets = ['/usr/local/sbin/menu', '/usr/local/sbin/menu-sc-1forcr'];
+  const changed = [];
+  for (const p of targets) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      execFileSync('chmod', [mode, p], { stdio: 'ignore' });
+      changed.push(p);
+    } catch (_) {}
+  }
+  return changed;
+}
+
+function applyScAccessLock(blockedInput, reasonInput, actorInput) {
+  const blocked = blockedInput === true || /^(1|true|yes|on)$/i.test(String(blockedInput || '').trim());
+  const reason = String(reasonInput || 'locked_by_admin').trim() || 'locked_by_admin';
+  const actor = String(actorInput || '').trim() || '-';
+
+  if (blocked) {
+    const payload = [
+      `blocked=1`,
+      `reason=${reason}`,
+      `actor=${actor}`,
+      `at=${new Date().toISOString()}`
+    ].join('\n') + '\n';
+    try {
+      fs.writeFileSync(SC_ACCESS_LOCK_FILE, payload, 'utf8');
+      try { fs.chmodSync(SC_ACCESS_LOCK_FILE, 0o600); } catch (_) {}
+      const changedMenus = setScMenuExecutable();
+      return { ok: true, blocked: true, lock_file: SC_ACCESS_LOCK_FILE, changed_menus: changedMenus };
+    } catch (err) {
+      return { ok: false, statusCode: 500, message: `gagal tulis lock file: ${err.message}` };
+    }
+  }
+
+  try {
+    if (fs.existsSync(SC_ACCESS_LOCK_FILE)) fs.unlinkSync(SC_ACCESS_LOCK_FILE);
+    const changedMenus = setScMenuExecutable();
+    return { ok: true, blocked: false, lock_file: SC_ACCESS_LOCK_FILE, changed_menus: changedMenus };
+  } catch (err) {
+    return { ok: false, statusCode: 500, message: `gagal hapus lock file: ${err.message}` };
+  }
+}
+
+function sanitizeUpdateLine(input, maxLen = 512) {
+  return String(input || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\n+/g, ' | ')
+    .replace(/[^\x20-\x7E]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, Math.max(1, Number(maxLen) || 512));
+}
+
+function parseEnvLine(rawContent, key) {
+  const content = String(rawContent || '');
+  const re = new RegExp(`^${String(key).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=(.*)$`, 'm');
+  const m = content.match(re);
+  if (!m) return '';
+  return String(m[1] || '').trim().replace(/^["']|["']$/g, '');
+}
+
+function applyScRegistrationMeta(payloadInput = {}) {
+  const payload = payloadInput && typeof payloadInput === 'object' ? payloadInput : {};
+  const clientName = sanitizeUpdateLine(payload.client_name || payload.client || '', 96);
+  const status = sanitizeUpdateLine(payload.status || 'active', 24).toLowerCase() || 'active';
+  const nowIso = new Date().toISOString();
+
+  let expiresAt = Number(payload.expires_at);
+  if (!Number.isFinite(expiresAt)) expiresAt = Number(payload.expired_at);
+  if (!Number.isFinite(expiresAt)) expiresAt = Number(payload.expiry);
+  if (!Number.isFinite(expiresAt)) expiresAt = 0;
+  expiresAt = Math.floor(Math.max(0, expiresAt));
+
+  const lines = [
+    `SC_STATUS=${status || 'active'}`,
+    `SC_CLIENT_NAME=${clientName || '-'}`,
+    `SC_EXPIRES_AT=${expiresAt}`,
+    `SC_UPDATED_AT_ISO=${nowIso}`,
+    ''
+  ].join('\n');
+
+  try {
+    const dir = require('path').dirname(SC_REG_META_FILE);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(SC_REG_META_FILE, lines, 'utf8');
+    try { fs.chmodSync(SC_REG_META_FILE, 0o644); } catch (_) {}
+    return { ok: true, path: SC_REG_META_FILE, status, client_name: clientName || '-', expires_at: expiresAt };
+  } catch (err) {
+    return { ok: false, statusCode: 500, message: `gagal tulis sc registration meta: ${err.message}` };
+  }
+}
+
+function readScTelegramConfig() {
+  let token = String(process.env.SC_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  let chatId = String(process.env.SC_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID || '').trim();
+  try {
+    if (fs.existsSync(SC_RUNTIME_ENV_FILE)) {
+      const raw = fs.readFileSync(SC_RUNTIME_ENV_FILE, 'utf8');
+      if (!token) token = parseEnvLine(raw, 'TELEGRAM_BOT_TOKEN');
+      if (!chatId) chatId = parseEnvLine(raw, 'TELEGRAM_CHAT_ID');
+    }
+  } catch (_) {}
+  return { token, chatId };
+}
+
+async function sendScTelegramMessage(textInput) {
+  const text = String(textInput || '').trim();
+  if (!text) return { ok: false, statusCode: 400, message: 'message kosong' };
+  const cfg = readScTelegramConfig();
+  if (!cfg.token || !cfg.chatId) {
+    return { ok: false, statusCode: 400, message: 'TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID belum diset di VPS' };
+  }
+  const url = `https://api.telegram.org/bot${cfg.token}/sendMessage`;
+  try {
+    const body = new URLSearchParams();
+    body.append('chat_id', cfg.chatId);
+    body.append('text', text);
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString()
+    });
+    const raw = await resp.text();
+    let parsed = null;
+    try { parsed = raw ? JSON.parse(raw) : null; } catch (_) {}
+    if (!resp.ok || !parsed?.ok) {
+      return {
+        ok: false,
+        statusCode: Number(resp.status || 500),
+        message: 'telegram sendMessage gagal',
+        telegram_response: parsed || raw || null
+      };
+    }
+    return { ok: true, chat_id: cfg.chatId };
+  } catch (err) {
+    return { ok: false, statusCode: 500, message: err?.message || 'request telegram gagal' };
+  }
+}
+
+function readCoreApiRuntimeConfig() {
+  const envFile = '/opt/sc-1forcr/.env';
+  let token = String(process.env.CORE_AUTH_TOKEN || '').trim();
+  let port = Number(process.env.CORE_API_PORT || 8088);
+
+  try {
+    if (fs.existsSync(envFile)) {
+      const raw = fs.readFileSync(envFile, 'utf8');
+      if (!token) token = parseEnvLine(raw, 'AUTH_TOKEN');
+      const p = Number(parseEnvLine(raw, 'API_PORT') || 0);
+      if (Number.isFinite(p) && p > 0) port = p;
+    }
+  } catch (_) {}
+
+  if (!token) return { ok: false, message: 'AUTH_TOKEN API utama tidak ditemukan' };
+  if (!Number.isFinite(port) || port < 1) port = 8088;
+  return { ok: true, token, port };
+}
+
+async function renewXrayAccount(typeInput, usernameInput, daysInput) {
+  const type = String(typeInput || '').trim().toLowerCase();
+  const username = String(usernameInput || '').trim();
+  const days = Number.isFinite(Number(daysInput)) ? Math.max(0, Math.floor(Number(daysInput))) : 0;
+  const routeMap = {
+    vmess: '/vps/renewvmess',
+    vless: '/vps/renewvless',
+    trojan: '/vps/renewtrojan'
+  };
+  const renewBase = routeMap[type];
+  if (!renewBase) {
+    return { ok: false, statusCode: 400, message: 'type harus vmess/vless/trojan' };
+  }
+  if (!username) {
+    return { ok: false, statusCode: 400, message: 'username required' };
+  }
+
+  const core = readCoreApiRuntimeConfig();
+  if (!core.ok) {
+    return { ok: false, statusCode: 500, message: core.message };
+  }
+
+  const url = `http://127.0.0.1:${core.port}${renewBase}/${encodeURIComponent(username)}/${days}`;
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: core.token,
+        'Content-Type': 'application/json'
+      },
+      body: '{}'
+    });
+    const text = await resp.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch (_) {}
+    if (!resp.ok) {
+      return {
+        ok: false,
+        statusCode: Number(resp.status || 500),
+        message: `core renew gagal (${resp.status})`,
+        core_response: body || text || null
+      };
+    }
+    return { ok: true, type, username, days, core_response: body || text || null };
+  } catch (err) {
+    return {
+      ok: false,
+      statusCode: 500,
+      message: err?.message || 'request renew ke API utama gagal'
+    };
+  }
+}
+
 function authorizeAndRun(req, res, runHandler) {
   const incomingToken = String(req.headers['x-sync-token'] || '').trim();
   if (!incomingToken) {
@@ -1307,6 +2221,13 @@ app.get('/internal/export-banner-config', (req, res) => {
   });
 });
 
+app.get('/internal/export-runtime-settings', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    return sendExportRuntimeSettings(res);
+  });
+});
+
 app.post('/internal/import-accounts', (req, res) => {
   const type = String(req.body?.type || '').trim();
   const accounts = req.body?.accounts;
@@ -1371,6 +2292,17 @@ app.post('/internal/restore-banner-config', (req, res) => {
   });
 });
 
+app.post('/internal/restore-runtime-settings', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = restoreRuntimeSettings(req.body?.settings || req.body || {});
+    if (!result.ok) {
+      return res.status(400).json({ ok: false, message: result.message });
+    }
+    return res.json(result);
+  });
+});
+
 app.post('/internal/restore-full-backup-url', (req, res) => {
   const fileUrl = String(req.body?.file_url || '').trim();
   const fileName = String(req.body?.file_name || '').trim();
@@ -1381,6 +2313,130 @@ app.post('/internal/restore-full-backup-url', (req, res) => {
       return res.status(Number(result.statusCode || 500)).json({ ok: false, message: result.message });
     }
     return res.json(result);
+  });
+});
+
+app.post('/internal/renew-xray-account', (req, res) => {
+  const type = String(req.body?.type || '').trim();
+  const username = String(req.body?.username || '').trim();
+  const days = Number(req.body?.days || 0);
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    renewXrayAccount(type, username, days)
+      .then((result) => {
+        if (!result.ok) {
+          return res.status(Number(result.statusCode || 500)).json({
+            ok: false,
+            message: result.message,
+            core_response: result.core_response || null
+          });
+        }
+        return res.json(result);
+      })
+      .catch((err) => {
+        return res.status(500).json({ ok: false, message: err?.message || 'renew gagal' });
+      });
+  });
+});
+
+app.post('/internal/sync-xray-from-db', (req, res) => {
+  const type = String(req.body?.type || '').trim().toLowerCase();
+  const restartRaw = req.body?.restart;
+  const restart = restartRaw === true || /^(1|true|yes|on)$/i.test(String(restartRaw || '').trim());
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    syncXrayConfigFromDbByType(type, restart)
+      .then((result) => {
+        if (!result.ok) {
+          return res.status(Number(result.statusCode || 500)).json(result);
+        }
+        return res.json(result);
+      })
+      .catch((err) => {
+        return res.status(500).json({ ok: false, message: err?.message || 'sync xray gagal' });
+      });
+  });
+});
+
+app.post('/internal/apply-xray-restart', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const restart = restartXrayService();
+    if (!restart.ok) {
+      return res.status(500).json({ ok: false, message: restart.message || 'restart xray gagal' });
+    }
+    return res.json({ ok: true, xray_restart: restart });
+  });
+});
+
+app.post('/internal/sc-access-lock', (req, res) => {
+  const blocked = req.body?.blocked;
+  const reason = String(req.body?.reason || '').trim();
+  const actor = String(req.body?.actor || '').trim();
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = applyScAccessLock(blocked, reason, actor);
+    if (!result.ok) {
+      return res.status(Number(result.statusCode || 500)).json(result);
+    }
+    return res.json(result);
+  });
+});
+
+app.post('/internal/sc-expired-notify', (req, res) => {
+  const ip = String(req.body?.ip || '').trim() || '-';
+  const reason = String(req.body?.reason || 'expired').trim();
+  const actor = String(req.body?.actor || '-').trim();
+  const users = Array.isArray(req.body?.users) ? req.body.users : [];
+  const usersText = users
+    .map((u) => String(u || '').trim())
+    .filter(Boolean)
+    .slice(0, 50)
+    .join(', ');
+  const customMessage = String(req.body?.message || '').trim();
+  const message = customMessage || [
+    'SC 1FORCR NOTIF',
+    `Status : SC expired`,
+    `IP VPS : ${ip}`,
+    `Reason : ${reason}`,
+    `Actor  : ${actor}`,
+    `Users  : ${usersText || '-'}`,
+    '',
+    'Silakan perpanjang SC jika ingin akses kembali.'
+  ].join('\n');
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    sendScTelegramMessage(message)
+      .then((result) => {
+        if (!result.ok) {
+          return res.status(Number(result.statusCode || 500)).json(result);
+        }
+        return res.json({ ok: true, sent: true, chat_id: result.chat_id });
+      })
+      .catch((err) => {
+        return res.status(500).json({ ok: false, message: err?.message || 'notif telegram gagal' });
+      });
+  });
+});
+
+app.post('/internal/sc-registration-meta', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = applyScRegistrationMeta(req.body || {});
+    if (!result.ok) {
+      return res.status(Number(result.statusCode || 500)).json(result);
+    }
+    return res.json(result);
+  });
+});
+
+app.post('/internal/trigger-update', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    return res.status(410).json({
+      ok: false,
+      message: 'endpoint trigger-update sudah dinonaktifkan permanen'
+    });
   });
 });
 
@@ -1404,12 +2460,17 @@ JS
   cat > "${APP_DIR}/.env" <<EOF
 SUMMARY_PORT=${SUMMARY_PORT}
 POTATO_DB=${POTATO_DB}
+SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
 USE_DB_AUTH=1
 SYNC_TOKEN=
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=
 BANNER_HTML_FILE=/etc/sc-1forcr/banner.html
 BANNER_TXT_FILE=/etc/sc-1forcr/banner.txt
+XRAY_CONFIG_FILE=/usr/local/etc/xray/config.json
+SC_ACCESS_LOCK_FILE=/etc/sc-1forcr-access.lock
+SC_RUNTIME_ENV_FILE=/etc/sc-1forcr.env
+SC_REG_META_FILE=/etc/sc-1forcr-registration.env
 FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
 RESTORE_TMP_DIR=/tmp
 EOF
@@ -1492,6 +2553,18 @@ print_result() {
   echo
   echo "ZIVPN service control check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"action\":\"status\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/zivpn-service\" && echo"
+  echo
+  echo "Sync Xray from DB check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"type\":\"vmess\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sync-xray-from-db\" && echo"
+  echo
+  echo "Apply Xray restart check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/apply-xray-restart\" && echo"
+  echo
+  echo "SC access lock check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"blocked\":true,\"reason\":\"admin_remove_sc_ip\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sc-access-lock\" && echo"
+  echo
+  echo "SC expired notify check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"ip\":\"1.2.3.4\",\"reason\":\"admin_remove_sc_ip\",\"actor\":\"123\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sc-expired-notify\" && echo"
   echo
   echo "Full restore from Telegram URL check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" \\"
