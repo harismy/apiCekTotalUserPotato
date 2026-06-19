@@ -6,7 +6,7 @@ APP_NAME="${APP_NAME:-tunnel-summary}"
 SUMMARY_PORT="${SUMMARY_PORT:-8789}"
 SUMMARY_HOST="${SUMMARY_HOST:-0.0.0.0}"
 POTATO_DB="${POTATO_DB:-/usr/sbin/potatonc/potato.db}"
-SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
+SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root (or use sudo)."
@@ -71,13 +71,15 @@ app.use(express.json({ limit: '2mb' }));
 const PORT = Number(process.env.SUMMARY_PORT || 8789);
 const HOST = String(process.env.SUMMARY_HOST || '0.0.0.0').trim() || '0.0.0.0';
 const DB = process.env.POTATO_DB || '/usr/sbin/potatonc/potato.db';
-const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
+const DEFAULT_TUNNEL_SHELL = '/usr/local/sbin/sc-1forcr-tunnel-shell';
+const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || DEFAULT_TUNNEL_SHELL).trim() || DEFAULT_TUNNEL_SHELL;
 const USE_DB_AUTH = String(process.env.USE_DB_AUTH || '1') !== '0';
 const STATIC_TOKEN = (process.env.SYNC_TOKEN || '').trim();
 const FULL_RESTORE_SCRIPT = String(process.env.FULL_RESTORE_SCRIPT || '/usr/local/sbin/sc-1forcr-restore-backup').trim();
 const RESTORE_TMP_DIR = String(process.env.RESTORE_TMP_DIR || '/tmp').trim();
 const BANNER_HTML_FILE = String(process.env.BANNER_HTML_FILE || '/etc/sc-1forcr/banner.html').trim();
 const BANNER_TXT_FILE = String(process.env.BANNER_TXT_FILE || '/etc/sc-1forcr/banner.txt').trim();
+const DB_BUSY_TIMEOUT_MS = Math.max(1000, Math.min(30000, Number(process.env.DB_BUSY_TIMEOUT_MS || 8000)));
 const XRAY_CONFIG_FILE = String(process.env.XRAY_CONFIG_FILE || '/usr/local/etc/xray/config.json').trim();
 const SC_ACCESS_LOCK_FILE = String(process.env.SC_ACCESS_LOCK_FILE || '/etc/sc-1forcr-access.lock').trim();
 const SC_RUNTIME_ENV_FILE = String(process.env.SC_RUNTIME_ENV_FILE || '/etc/sc-1forcr.env').trim();
@@ -92,18 +94,24 @@ const RUNTIME_SETTINGS_KEYS = Object.freeze([
   'AUTO_BACKUP_WIB_HOUR',
   'AUTO_REBOOT_ENABLE',
   'AUTO_REBOOT_INTERVAL_MINUTES',
+  'AUTO_REBOOT_SCHEDULE_MODE',
+  'AUTO_REBOOT_WIB_HOUR',
   'AUTO_PULL_UPDATE_ENABLE',
   'AUTO_PULL_UPDATE_INTERVAL_MINUTES',
+  'AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES',
   'ONLINE_NOTIFY_ENABLE',
   'ONLINE_NOTIFY_INTERVAL_HOURS',
   'ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS',
   'IPLIMIT_CHECK_INTERVAL_MINUTES',
   'IPLIMIT_LOCK_MINUTES',
   'IPLIMIT_AUTO_LOCK_ENABLE',
+  'QUOTA_LOCK_ENABLE',
   'IPLIMIT_AUTO_TUNE',
   'IPLIMIT_DEBUG',
   'DROPBEAR_LOG_MAX_LINES',
   'DROPBEAR_RECENT_LOG_MAX_LINES',
+  'DROPBEAR_KEEPALIVE_SECONDS',
+  'DROPBEAR_IDLE_TIMEOUT_SECONDS',
   'UDPHC_LOG_LINES_HISTORY',
   'UDPHC_LOG_LINES_REALTIME',
   'UDPHC_LOG_LINES_CHECKER',
@@ -126,6 +134,7 @@ const RUNTIME_SETTINGS_KEYS = Object.freeze([
   'ZIVPN_RELOAD_ON_AUTH_CHANGE',
   'ACTIVE_UDP_BACKEND',
   'SSH_HC_AUTH_LOOKBACK_HOURS',
+  'SSHWS_TCP_KEEPALIVE_SECONDS',
   'SSHWS_UDPGW_PORTS',
   'SSH_TUNNEL_SHELL',
   'SSH_TUNNEL_BLOCK_OUTBOUND_SSH',
@@ -148,6 +157,12 @@ const RUNTIME_SETTINGS_KEY_SET = new Set(RUNTIME_SETTINGS_KEYS);
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
   process.exit(1);
+}
+
+function openDatabase() {
+  const db = new sqlite3.Database(DB);
+  try { db.configure('busyTimeout', DB_BUSY_TIMEOUT_MS); } catch (_) {}
+  return db;
 }
 
 function ensureRuntimeTables(db, cb) {
@@ -311,16 +326,34 @@ function isValidUnixUsername(username) {
   return /^[a-z0-9][a-z0-9_-]{2,31}$/.test(String(username || '').trim());
 }
 
+function ensureTunnelHoldShell() {
+  try {
+    fs.mkdirSync('/usr/local/sbin', { recursive: true });
+    const content = `#!/usr/bin/env bash
+set -euo pipefail
+trap 'exit 0' HUP INT TERM
+while true; do
+  sleep 86400 &
+  wait "$!" || true
+done
+`;
+    fs.writeFileSync(DEFAULT_TUNNEL_SHELL, content, { mode: 0o755 });
+    fs.chmodSync(DEFAULT_TUNNEL_SHELL, 0o755);
+  } catch (_) {}
+}
+
 function resolveTunnelShell() {
-  const choices = [SSH_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
+  if (SSH_TUNNEL_SHELL === DEFAULT_TUNNEL_SHELL) ensureTunnelHoldShell();
+  const choices = [SSH_TUNNEL_SHELL, DEFAULT_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
     .map((v) => String(v || '').trim())
     .filter(Boolean);
   for (const shell of choices) {
+    if (shell === DEFAULT_TUNNEL_SHELL) ensureTunnelHoldShell();
     try {
       if (fs.existsSync(shell)) return shell;
     } catch (_) {}
   }
-  return '/usr/sbin/nologin';
+  return DEFAULT_TUNNEL_SHELL;
 }
 
 function ensureTunnelShellAllowed() {
@@ -582,6 +615,53 @@ function getXrayCredentialFromRow(type, row) {
   return '';
 }
 
+function numericValue(input, fallback = 0) {
+  const n = Number(input);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function bytesToQuotaGb(input) {
+  const n = numericValue(input, 0);
+  if (n <= 0) return 0;
+  return Math.max(1, Math.ceil(n / (1024 * 1024 * 1024)));
+}
+
+function normalizeImportedStatus(statusInput) {
+  const s = String(statusInput || '').trim().toUpperCase();
+  if (!s) return 'AKTIF';
+  if (['AKTIF', 'ACTIVE', 'NORMAL', 'UNLOCKED', 'ENABLE', 'ENABLED', 'OK'].includes(s)) return 'AKTIF';
+  if (['EXPIRED', 'KADALUARSA', 'RECOVERY'].includes(s)) return 'EXPIRED';
+  if (['LOCK', 'LOCKED', 'LOCK_TMP', 'LOCK_QUOTA', 'BANNED', 'BAN'].includes(s)) return 'LOCK';
+  return 'AKTIF';
+}
+
+function normalizeImportedAccountRow(type, rowInput) {
+  const typeKey = String(type || '').trim().toLowerCase();
+  const row = { ...((rowInput && typeof rowInput === 'object') ? rowInput : {}) };
+  row.username = String(row.username || '').trim();
+  row.status = normalizeImportedStatus(row.status || row.status_lock || row.type);
+
+  if ((row.limitip === undefined || row.limitip === null || row.limitip === '') && row.limit_ip !== undefined && row.limit_ip !== null) {
+    row.limitip = row.limit_ip;
+  }
+
+  if ((row.quota === undefined || row.quota === null || row.quota === '' || Number(row.quota || 0) <= 0) && numericValue(row.max_bw, 0) > 0) {
+    row.quota = bytesToQuotaGb(row.max_bw);
+  }
+
+  if (typeKey === 'trojan') {
+    const pass = String(row.password || '').trim();
+    const uid = String(row.uuid || row.id || row.secret || '').trim();
+    if (!pass && uid) row.password = uid;
+  } else if (typeKey === 'vmess' || typeKey === 'vless') {
+    const uuid = String(row.uuid || '').trim();
+    const alt = String(row.id || row.password || row.secret || '').trim();
+    if (!uuid && alt) row.uuid = alt;
+  }
+
+  return row;
+}
+
 function normalizeXrayClientsForType(type, rows, templateClient) {
   const list = Array.isArray(rows) ? rows : [];
   const tpl = (templateClient && typeof templateClient === 'object') ? { ...templateClient } : {};
@@ -654,6 +734,36 @@ function buildDefaultXrayInbound(type) {
   return null;
 }
 
+function buildDefaultXrayGrpcInbound(type) {
+  if (type === 'vmess') {
+    return {
+      port: 11001, listen: '127.0.0.1', protocol: 'vmess',
+      settings: { clients: [] },
+      streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+    };
+  }
+  if (type === 'vless') {
+    return {
+      port: 11002, listen: '127.0.0.1', protocol: 'vless',
+      settings: { clients: [], decryption: 'none' },
+      streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+    };
+  }
+  if (type === 'trojan') {
+    return {
+      port: 11003, listen: '127.0.0.1', protocol: 'trojan',
+      settings: { clients: [] },
+      streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
+    };
+  }
+  return null;
+}
+
+function isGrpcInboundForType(inbound, type) {
+  return String(inbound?.protocol || '').trim().toLowerCase() === type &&
+    String(inbound?.streamSettings?.network || '').trim().toLowerCase() === 'grpc';
+}
+
 function writeXrayConfigToCandidates(cfgObj, primaryPath) {
   const content = JSON.stringify(cfgObj, null, 2);
   const candidates = getXrayConfigCandidates();
@@ -700,7 +810,7 @@ function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
       return resolve({ ok: false, statusCode: 500, message: `config xray tidak ditemukan: ${cfgPath}` });
     }
 
-    const cfgDb = new sqlite3.Database(DB);
+    const cfgDb = openDatabase();
     cfgDb.all(
       `SELECT * FROM ${table} WHERE UPPER(TRIM(COALESCE(status, '')))='AKTIF' ORDER BY rowid DESC`,
       [],
@@ -728,6 +838,13 @@ function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
           }
           inbounds.push(createdInbound);
           targetInbounds = [createdInbound];
+        }
+        if (!targetInbounds.some((ib) => isGrpcInboundForType(ib, type))) {
+          const grpcInbound = buildDefaultXrayGrpcInbound(type);
+          if (grpcInbound) {
+            inbounds.push(grpcInbound);
+            targetInbounds.push(grpcInbound);
+          }
         }
 
         const firstTemplate = Array.isArray(targetInbounds[0]?.settings?.clients) && targetInbounds[0].settings.clients[0]
@@ -1309,14 +1426,80 @@ WantedBy=timers.target
   return true;
 }
 
+function writeAutoRebootScript() {
+  const scriptPath = '/usr/local/sbin/sc-1forcr-safe-reboot';
+  try {
+    fs.writeFileSync(scriptPath, [
+      '#!/usr/bin/env bash',
+      'set -euo pipefail',
+      '',
+      'ENV_FILE="/etc/sc-1forcr.env"',
+      '[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true',
+      '',
+      'AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-0}"',
+      'AUTO_REBOOT_SCHEDULE_MODE="$(echo "${AUTO_REBOOT_SCHEDULE_MODE:-interval}" | tr \'[:upper:]\' \'[:lower:]\' | tr -d \'[:space:]\')"',
+      'AUTO_REBOOT_WIB_HOUR="$(echo "${AUTO_REBOOT_WIB_HOUR:-3}" | tr -cd \'0-9\')"',
+      '[[ -n "${AUTO_REBOOT_WIB_HOUR}" ]] && AUTO_REBOOT_WIB_HOUR="$((10#${AUTO_REBOOT_WIB_HOUR}))"',
+      '[[ "${AUTO_REBOOT_ENABLE}" == "1" ]] || exit 0',
+      'case "${AUTO_REBOOT_SCHEDULE_MODE}" in',
+      '  daily|daily_wib|wib) AUTO_REBOOT_SCHEDULE_MODE="daily_wib" ;;',
+      '  *) AUTO_REBOOT_SCHEDULE_MODE="interval" ;;',
+      'esac',
+      '[[ -z "${AUTO_REBOOT_WIB_HOUR}" || "${AUTO_REBOOT_WIB_HOUR}" -gt 23 ]] && AUTO_REBOOT_WIB_HOUR="3"',
+      '',
+      'if [[ "${AUTO_REBOOT_SCHEDULE_MODE}" == "daily_wib" ]]; then',
+      '  wib_now="$(TZ=Asia/Jakarta date +%H)"',
+      '  wib_date="$(TZ=Asia/Jakarta date +%F)"',
+      '  target_hour="$(printf "%02d" "${AUTO_REBOOT_WIB_HOUR}")"',
+      '  stamp_file="/var/lib/sc-1forcr/last-auto-reboot-date"',
+      '  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true',
+      '  [[ "${wib_now}" == "${target_hour}" ]] || exit 0',
+      '  [[ "$(cat "${stamp_file}" 2>/dev/null || true)" == "${wib_date}" ]] && exit 0',
+      "  uptime_sec=\"$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)\"",
+      '  [[ "${uptime_sec}" -lt 600 ]] && exit 0',
+      '  printf \'%s\\n\' "${wib_date}" > "${stamp_file}" 2>/dev/null || true',
+      'fi',
+      '',
+      'logger -t sc-1forcr "Auto reboot timer triggered (${AUTO_REBOOT_SCHEDULE_MODE})."',
+      'sync',
+      'sleep 2',
+      '/usr/bin/systemctl --force reboot'
+    ].join('\n') + '\n', { mode: 0o755 });
+    fs.chmodSync(scriptPath, 0o755);
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
 function writeAutoRebootTimerUnit(settings) {
   if (!fs.existsSync('/etc/systemd/system/sc-1forcr-autoreboot.service')) return false;
+  writeAutoRebootScript();
   const interval = intSetting(settings, 'AUTO_REBOOT_INTERVAL_MINUTES', 1440, 30, 10080);
+  const modeRaw = String(settings?.AUTO_REBOOT_SCHEDULE_MODE || 'interval').trim().toLowerCase();
+  const mode = ['daily', 'daily_wib', 'wib'].includes(modeRaw) ? 'daily_wib' : 'interval';
+  const wibHour = intSetting(settings, 'AUTO_REBOOT_WIB_HOUR', 3, 0, 23);
+  if (mode === 'daily_wib') {
+    fs.writeFileSync('/etc/systemd/system/sc-1forcr-autoreboot.timer', `[Unit]
+Description=Run SC 1FORCR auto reboot daily at ${String(wibHour).padStart(2, '0')}:00 WIB
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+    return true;
+  }
   fs.writeFileSync('/etc/systemd/system/sc-1forcr-autoreboot.timer', `[Unit]
 Description=Run SC 1FORCR auto reboot every ${interval} minutes
 
 [Timer]
-OnBootSec=10m
+OnBootSec=${interval}min
 OnUnitActiveSec=${interval}min
 Persistent=true
 AccuracySec=1min
@@ -1330,7 +1513,7 @@ WantedBy=timers.target
 
 function writePullUpdateTimerUnit(settings) {
   if (!fs.existsSync('/etc/systemd/system/sc-1forcr-pull-update.service')) return false;
-  const interval = intSetting(settings, 'AUTO_PULL_UPDATE_INTERVAL_MINUTES', 10, 1, 1440);
+  const interval = intSetting(settings, 'AUTO_PULL_UPDATE_INTERVAL_MINUTES', 360, 1, 1440);
   fs.writeFileSync('/etc/systemd/system/sc-1forcr-pull-update.timer', `[Unit]
 Description=Check SC 1FORCR update trigger every ${interval} minutes
 
@@ -1391,7 +1574,7 @@ function applyRuntimeSettingsUnits(settings) {
   }
 
   if (hasAutoRebootTimer) {
-    if (enabledSetting(settings, 'AUTO_REBOOT_ENABLE', '1') === '1') {
+    if (enabledSetting(settings, 'AUTO_REBOOT_ENABLE', '0') === '1') {
       actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-autoreboot.timer']));
       actions.push(runSystemctl(['restart', 'sc-1forcr-autoreboot.timer']));
     } else {
@@ -1518,25 +1701,7 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
       return res.status(500).json({ ok: false, message: `kolom username tidak ada di ${table}` });
     }
 
-    const importRows = (Array.isArray(accounts) ? accounts : []).map((raw) => ({ ...(raw || {}) }));
-
-    // Kompatibilitas backup lintas script:
-    // - Beberapa backup (mis. potato) mengirim trojan credential di field "uuid"
-    // - DB 1FORCR menyimpan trojan credential di kolom "password"
-    if (type === 'trojan') {
-      for (const r of importRows) {
-        const pass = String(r.password || '').trim();
-        const uid = String(r.uuid || r.id || r.secret || '').trim();
-        if (!pass && uid) r.password = uid;
-      }
-    }
-
-    // Kompatibilitas nama field limit IP lintas source.
-    for (const r of importRows) {
-      if ((r.limitip === undefined || r.limitip === null || r.limitip === '') && r.limit_ip !== undefined && r.limit_ip !== null) {
-        r.limitip = r.limit_ip;
-      }
-    }
+    const importRows = (Array.isArray(accounts) ? accounts : []).map((raw) => normalizeImportedAccountRow(type, raw));
 
     const insertCols = columns.filter((col) => importRows.some((row) => Object.prototype.hasOwnProperty.call(row || {}, col)));
     if (!insertCols.includes('username')) insertCols.unshift('username');
@@ -1601,7 +1766,7 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
             });
           };
           if (getXrayProtocolByType(type)) {
-            return syncXrayConfigFromDbByType(type, false).then((syncRes) => {
+            return syncXrayConfigFromDbByType(type, true).then((syncRes) => {
               if (!syncRes.ok) {
                 return res.status(Number(syncRes.statusCode || 500)).json({
                   ok: false,
@@ -2109,6 +2274,75 @@ async function sendScTelegramMessage(textInput) {
   }
 }
 
+function formatScNotifyDateTime(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return '-';
+  return new Date(n).toLocaleString('id-ID', { hour12: false, timeZone: 'Asia/Jakarta' });
+}
+
+function formatScNotifyRemaining(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return '-';
+  const diff = n - Date.now();
+  if (diff <= 0) return 'sudah expired';
+  const totalMinutes = Math.floor(diff / 60000);
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days} hari ${hours} jam ${minutes} menit`;
+  if (hours > 0) return `${hours} jam ${minutes} menit`;
+  return `${Math.max(1, minutes)} menit`;
+}
+
+function buildScExpiredNotifyMessage(payload = {}) {
+  const customMessage = String(payload?.message || '').trim();
+  if (customMessage) return customMessage;
+
+  const ip = String(payload?.ip || '').trim() || '-';
+  const reason = String(payload?.reason || 'expired').trim();
+  const actor = String(payload?.actor || '-').trim();
+  const users = Array.isArray(payload?.users) ? payload.users : [];
+  const usersText = users
+    .map((u) => String(u || '').trim())
+    .filter(Boolean)
+    .slice(0, 50)
+    .join(', ');
+  const expiresAt = Number(payload?.expires_at || payload?.expired_at || 0);
+  const isReminder = reason === 'h2_reminder';
+
+  if (isReminder) {
+    return [
+      'SC 1FORCR NOTIF',
+      '==============================',
+      'Event   : SC H-2 REMINDER',
+      'Status  : AKTIF',
+      `IP VPS  : ${ip}`,
+      `Actor   : ${actor}`,
+      `Users   : ${usersText || '-'}`,
+      `Expired : ${formatScNotifyDateTime(expiresAt)}`,
+      `Sisa    : ${formatScNotifyRemaining(expiresAt)}`,
+      '==============================',
+      '',
+      'Silakan perpanjang sebelum expired agar akses tidak terblokir.'
+    ].join('\n');
+  }
+
+  return [
+    'SC 1FORCR NOTIF',
+    '==============================',
+    'Event  : SC EXPIRED',
+    'Status : SC expired',
+    `IP VPS : ${ip}`,
+    `Reason : ${reason}`,
+    `Actor  : ${actor}`,
+    `Users  : ${usersText || '-'}`,
+    `Time   : ${formatScNotifyDateTime(Date.now())}`,
+    '==============================',
+    '',
+    'Silakan perpanjang SC jika ingin akses kembali.'
+  ].join('\n');
+}
+
 function readCoreApiRuntimeConfig() {
   const envFile = '/opt/sc-1forcr/.env';
   let token = String(process.env.CORE_AUTH_TOKEN || '').trim();
@@ -2187,7 +2421,7 @@ function authorizeAndRun(req, res, runHandler) {
     return res.status(401).json({ ok: false, message: 'unauthorized' });
   }
 
-  const db = new sqlite3.Database(DB);
+  const db = openDatabase();
 
   if (USE_DB_AUTH) {
     db.get('SELECT COUNT(*) AS c FROM servers WHERE "key" = ?', [incomingToken], (authErr, authRow) => {
@@ -2434,26 +2668,7 @@ app.post('/internal/sc-access-lock', (req, res) => {
 });
 
 app.post('/internal/sc-expired-notify', (req, res) => {
-  const ip = String(req.body?.ip || '').trim() || '-';
-  const reason = String(req.body?.reason || 'expired').trim();
-  const actor = String(req.body?.actor || '-').trim();
-  const users = Array.isArray(req.body?.users) ? req.body.users : [];
-  const usersText = users
-    .map((u) => String(u || '').trim())
-    .filter(Boolean)
-    .slice(0, 50)
-    .join(', ');
-  const customMessage = String(req.body?.message || '').trim();
-  const message = customMessage || [
-    'SC 1FORCR NOTIF',
-    `Status : SC expired`,
-    `IP VPS : ${ip}`,
-    `Reason : ${reason}`,
-    `Actor  : ${actor}`,
-    `Users  : ${usersText || '-'}`,
-    '',
-    'Silakan perpanjang SC jika ingin akses kembali.'
-  ].join('\n');
+  const message = buildScExpiredNotifyMessage(req.body || {});
   return authorizeAndRun(req, res, (db) => {
     db.close();
     sendScTelegramMessage(message)
@@ -2514,6 +2729,7 @@ POTATO_DB=${POTATO_DB}
 SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
 USE_DB_AUTH=1
 SYNC_TOKEN=
+DB_BUSY_TIMEOUT_MS=8000
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=
 BANNER_HTML_FILE=/etc/sc-1forcr/banner.html
@@ -2587,8 +2803,19 @@ open_summary_firewall() {
 start_pm2_service() {
   cd "${APP_DIR}"
 
+  if [[ "${SUMMARY_UPDATE_SAFE_MODE:-0}" == "1" ]]; then
+    if pm2 describe "${APP_NAME}" >/dev/null 2>&1; then
+      pm2 restart "${APP_NAME}" --update-env >/dev/null 2>&1 || \
+        pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
+    else
+      pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
+    fi
+    pm2 save --force >/dev/null 2>&1 || true
+    return 0
+  fi
+
   pm2 delete "${APP_NAME}" >/dev/null 2>&1 || true
-  pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}"
+  pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M
   pm2 save --force
 
   pm2 startup systemd -u root --hp /root >/tmp/pm2-startup.out 2>&1 || true
@@ -2599,6 +2826,75 @@ start_pm2_service() {
 
   systemctl enable pm2-root >/dev/null 2>&1 || true
   systemctl restart pm2-root >/dev/null 2>&1 || true
+}
+
+install_summary_watchdog() {
+  local port app_name app_dir
+  port="$(echo "${SUMMARY_PORT:-8789}" | tr -cd '0-9')"
+  [[ -z "${port}" || "${port}" -lt 1 || "${port}" -gt 65535 ]] && port="8789"
+  app_name="${APP_NAME:-tunnel-summary}"
+  app_dir="${APP_DIR:-/root/tunnel-sync}"
+
+  cat > /usr/local/sbin/sc-1forcr-summary-watchdog <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+APP_NAME="${app_name}"
+APP_DIR="${app_dir}"
+PORT="${port}"
+LOG_TAG="sc-1forcr-summary-watchdog"
+
+log_msg() {
+  logger -t "\${LOG_TAG}" "\$*" 2>/dev/null || echo "[\${LOG_TAG}] \$*"
+}
+
+if curl -fsS --connect-timeout 2 --max-time 6 "http://127.0.0.1:\${PORT}/health" >/dev/null 2>&1; then
+  exit 0
+fi
+
+log_msg "summary api health gagal, restart pm2 \${APP_NAME}"
+if command -v pm2 >/dev/null 2>&1; then
+  pm2 restart "\${APP_NAME}" --update-env >/dev/null 2>&1 || \
+    pm2 start "\${APP_DIR}/summary-api.js" --name "\${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
+  pm2 save --force >/dev/null 2>&1 || true
+fi
+
+sleep 3
+if ! curl -fsS --connect-timeout 2 --max-time 6 "http://127.0.0.1:\${PORT}/health" >/dev/null 2>&1; then
+  log_msg "summary api masih gagal setelah restart"
+  exit 1
+fi
+
+log_msg "summary api pulih"
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-summary-watchdog
+
+  cat > /etc/systemd/system/sc-1forcr-summary-watchdog.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Summary API watchdog
+After=network-online.target pm2-root.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-summary-watchdog
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-summary-watchdog.timer <<'EOF'
+[Unit]
+Description=Run SC 1FORCR Summary API watchdog
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=2m
+AccuracySec=30s
+Unit=sc-1forcr-summary-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now sc-1forcr-summary-watchdog.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-summary-watchdog.timer >/dev/null 2>&1 || true
 }
 
 print_result() {
@@ -2655,5 +2951,6 @@ install_vnstat_if_missing
 write_files
 install_dependencies
 start_pm2_service
+install_summary_watchdog
 open_summary_firewall
 print_result
