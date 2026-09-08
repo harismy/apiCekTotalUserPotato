@@ -7,6 +7,7 @@ SUMMARY_PORT="${SUMMARY_PORT:-8789}"
 SUMMARY_HOST="${SUMMARY_HOST:-0.0.0.0}"
 POTATO_DB="${POTATO_DB:-/usr/sbin/potatonc/potato.db}"
 SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
+SUMMARY_UPDATE_SAFE_MODE="${SUMMARY_UPDATE_SAFE_MODE:-1}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root (or use sudo)."
@@ -17,29 +18,66 @@ log() {
   echo "[setup-summary-api] $*"
 }
 
+wait_for_apt_locks() {
+  local waited=0 max_wait=900
+  while true; do
+    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+       fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+       fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+       fuser /var/cache/apt/archives/lock >/dev/null 2>&1; then
+      if (( waited == 0 )); then
+        log "Menunggu lock apt/dpkg dilepas..."
+      fi
+      sleep 5
+      waited=$((waited + 5))
+      if (( waited >= max_wait )); then
+        log "Timeout menunggu lock apt/dpkg (${max_wait}s)."
+        return 1
+      fi
+      continue
+    fi
+    return 0
+  done
+}
+
+repair_dpkg_state() {
+  wait_for_apt_locks || return 1
+  if ! DEBIAN_FRONTEND=noninteractive dpkg --configure -a; then
+    log "dpkg --configure -a gagal. Selesaikan masalah dpkg lalu jalankan installer lagi."
+    return 1
+  fi
+  wait_for_apt_locks || return 1
+}
+
+apt_get_safe() {
+  repair_dpkg_state || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get "$@"
+}
+
 install_node_if_missing() {
   if command -v node >/dev/null 2>&1; then
     log "Node.js already installed: $(node -v)"
     return
   fi
 
-  log "Installing Node.js 20.x..."
-  apt-get update -y
-  apt-get install -y curl ca-certificates gnupg apt-transport-https
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-  log "Node.js installed: $(node -v)"
-}
-
-install_pm2_if_missing() {
-  if command -v pm2 >/dev/null 2>&1; then
-    log "PM2 already installed: $(pm2 -v)"
+  log "Installing Node.js (20.x, fallback 18.x)..."
+  apt_get_safe update -y
+  apt_get_safe install -y curl ca-certificates gnupg apt-transport-https
+  if curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt_get_safe install -y nodejs; then
+    log "Node.js installed: $(node -v)"
     return
   fi
 
-  log "Installing PM2..."
-  npm install -g pm2
-  log "PM2 installed: $(pm2 -v)"
+  log "Node.js 20.x gagal, fallback ke 18.x..."
+  apt_get_safe purge -y nodejs >/dev/null 2>&1 || true
+  rm -f /etc/apt/sources.list.d/nodesource.list
+  if curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && apt_get_safe install -y nodejs; then
+    log "Node.js installed: $(node -v)"
+    return
+  fi
+
+  echo "Gagal install Node.js dari NodeSource (20/18)."
+  exit 1
 }
 
 install_vnstat_if_missing() {
@@ -49,14 +87,15 @@ install_vnstat_if_missing() {
   fi
 
   log "Installing vnstat..."
-  apt-get update -y
-  apt-get install -y vnstat
+  apt_get_safe update -y
+  apt_get_safe install -y vnstat
   systemctl enable vnstat >/dev/null 2>&1 || true
   systemctl restart vnstat >/dev/null 2>&1 || true
   log "vnstat installed"
 }
 
 write_files() {
+  local existing_port
   mkdir -p "${APP_DIR}"
 
   cat > "${APP_DIR}/summary-api.js" <<'JS'
@@ -64,6 +103,7 @@ const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const { execFile, execFileSync } = require('child_process');
 const fs = require('fs');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -104,6 +144,7 @@ const RUNTIME_SETTINGS_KEYS = Object.freeze([
   'ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS',
   'IPLIMIT_CHECK_INTERVAL_MINUTES',
   'IPLIMIT_LOCK_MINUTES',
+  'IPLIMIT_LOCK_HISTORY_RETENTION_DAYS',
   'IPLIMIT_AUTO_LOCK_ENABLE',
   'QUOTA_LOCK_ENABLE',
   'IPLIMIT_AUTO_TUNE',
@@ -136,6 +177,7 @@ const RUNTIME_SETTINGS_KEYS = Object.freeze([
   'SSH_HC_AUTH_LOOKBACK_HOURS',
   'SSHWS_TCP_KEEPALIVE_SECONDS',
   'SSHWS_UDPGW_PORTS',
+  'SSHWS_UDPGW_SINGLE_PROCESS',
   'SSH_TUNNEL_SHELL',
   'SSH_TUNNEL_BLOCK_OUTBOUND_SSH',
   'SSH_TUNNEL_BLOCK_OUTBOUND_PORTS',
@@ -375,6 +417,7 @@ function syncSshLinuxUsers(accounts) {
   const tunnelShell = ensureTunnelShellAllowed();
   let created = 0;
   let updated = 0;
+  let disabled = 0;
   let skipped = 0;
   let failed = 0;
   const errors = [];
@@ -387,8 +430,9 @@ function syncSshLinuxUsers(accounts) {
     }
 
     const password = String(row?.password || username).trim() || username;
-    const dateExp = String(row?.date_exp || '').trim();
+    const dateExp = String(row?.date_exp || row?.exp || row?.to || '').trim();
     const homeDir = `/home/${username}`;
+    const shouldEnable = shouldEnableImportedSshUser(row);
 
     try {
       let exists = true;
@@ -396,6 +440,19 @@ function syncSshLinuxUsers(accounts) {
         execFileSync('id', ['-u', username], { stdio: 'ignore' });
       } catch (_) {
         exists = false;
+      }
+
+      if (!shouldEnable) {
+        if (!exists) {
+          skipped += 1;
+          continue;
+        }
+        try { execFileSync('pkill', ['-KILL', '-u', username], { stdio: 'ignore' }); } catch (_) {}
+        try { execFileSync('passwd', ['-l', username], { stdio: 'ignore' }); } catch (_) {}
+        const nologin = fs.existsSync('/usr/sbin/nologin') ? '/usr/sbin/nologin' : (fs.existsSync('/sbin/nologin') ? '/sbin/nologin' : '/bin/false');
+        execFileSync('usermod', ['-s', nologin, username], { stdio: 'ignore' });
+        disabled += 1;
+        continue;
       }
 
       if (!exists) {
@@ -409,9 +466,13 @@ function syncSshLinuxUsers(accounts) {
       execFileSync('chown', ['-R', `${username}:${username}`, homeDir], { stdio: 'ignore' });
       execFileSync('usermod', ['-d', homeDir, '-s', tunnelShell, username], { stdio: 'ignore' });
       execFileSync('chpasswd', [], { input: `${username}:${password}\n` });
+      try { execFileSync('passwd', ['-u', username], { stdio: 'ignore' }); } catch (_) {}
 
-      if (/^\d{4}-\d{2}-\d{2}$/.test(dateExp)) {
-        execFileSync('chage', ['-E', dateExp, username], { stdio: 'ignore' });
+      const linuxExp = linuxAccountExpiryDate(dateExp);
+      if (linuxExp) {
+        execFileSync('chage', ['-E', linuxExp, username], { stdio: 'ignore' });
+      } else {
+        try { execFileSync('chage', ['-E', '-1', username], { stdio: 'ignore' }); } catch (_) {}
       }
     } catch (err) {
       failed += 1;
@@ -423,6 +484,7 @@ function syncSshLinuxUsers(accounts) {
     ok: failed === 0,
     created,
     updated,
+    disabled,
     skipped,
     failed,
     errors
@@ -607,12 +669,32 @@ function getXrayCredentialFromRow(type, row) {
   const fromId = String(r.id || '').trim();
   const fromPassword = String(r.password || '').trim();
   if (type === 'vmess' || type === 'vless') {
-    return fromUuid || fromId || '';
+    return normalizeXrayUuid(type, r.username || r.email || '', fromUuid || fromId);
   }
   if (type === 'trojan') {
     return fromPassword || fromUuid || '';
   }
   return '';
+}
+
+function isValidXrayUuid(input) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(input || '').trim());
+}
+
+function deterministicXrayUuid(seed) {
+  const chars = crypto.createHash('sha256').update(String(seed || '')).digest('hex').slice(0, 32).split('');
+  chars[12] = '4';
+  chars[16] = (8 + (parseInt(chars[16] || '0', 16) % 4)).toString(16);
+  const hex = chars.join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+function normalizeXrayUuid(type, username, value) {
+  const raw = String(value || '').trim();
+  if (isValidXrayUuid(raw)) return raw.toLowerCase();
+  const user = String(username || '').trim();
+  if (!raw && !user) return '';
+  return deterministicXrayUuid(`${String(type || '').trim().toLowerCase()}:${user}:${raw || 'missing'}`);
 }
 
 function numericValue(input, fallback = 0) {
@@ -635,6 +717,57 @@ function normalizeImportedStatus(statusInput) {
   return 'AKTIF';
 }
 
+function parseDateExpMs(dateExpInput) {
+  const raw = String(dateExpInput || '').trim();
+  if (!raw) return 0;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const ms = Date.parse(`${raw}T00:00:00`);
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function isDateExpExpiredForRuntime(dateExpInput) {
+  const raw = String(dateExpInput || '').trim();
+  if (!raw) return false;
+  const ms = parseDateExpMs(raw);
+  if (!ms) return false;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return (ms + 24 * 60 * 60 * 1000) <= Date.now();
+  }
+  return ms <= Date.now();
+}
+
+function ymdLocalFromDate(dateInput) {
+  const d = dateInput instanceof Date ? dateInput : new Date(dateInput);
+  if (!Number.isFinite(d.getTime())) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function linuxAccountExpiryDate(dateExpInput) {
+  const raw = String(dateExpInput || '').trim();
+  if (!raw) return '';
+  const ms = parseDateExpMs(raw);
+  if (!ms) return '';
+  const d = new Date(ms);
+  // chage hanya presisi tanggal. Pakai H+1 agar akun dengan expired jam tertentu
+  // tidak terkunci lebih awal di hari yang sama.
+  d.setDate(d.getDate() + 1);
+  return ymdLocalFromDate(d);
+}
+
+function shouldEnableImportedSshUser(rowInput) {
+  const row = rowInput && typeof rowInput === 'object' ? rowInput : {};
+  const status = normalizeImportedStatus(row.status || row.status_lock || row.type);
+  if (status !== 'AKTIF') return false;
+  return !isDateExpExpiredForRuntime(row.date_exp || row.exp || row.to);
+}
+
 function normalizeImportedAccountRow(type, rowInput) {
   const typeKey = String(type || '').trim().toLowerCase();
   const row = { ...((rowInput && typeof rowInput === 'object') ? rowInput : {}) };
@@ -654,9 +787,7 @@ function normalizeImportedAccountRow(type, rowInput) {
     const uid = String(row.uuid || row.id || row.secret || '').trim();
     if (!pass && uid) row.password = uid;
   } else if (typeKey === 'vmess' || typeKey === 'vless') {
-    const uuid = String(row.uuid || '').trim();
-    const alt = String(row.id || row.password || row.secret || '').trim();
-    if (!uuid && alt) row.uuid = alt;
+    row.uuid = normalizeXrayUuid(typeKey, row.username, row.uuid || row.id || row.password || row.secret);
   }
 
   return row;
@@ -1376,11 +1507,11 @@ function writeIpLimitTimerUnit(intervalMinutes) {
 Description=Run SC 1FORCR IP Limit Checker every ${intervalMinutes} minutes
 
 [Timer]
-OnBootSec=15s
-OnUnitActiveSec=${intervalMinutes}min
+OnActiveSec=15s
+OnUnitInactiveSec=${intervalMinutes}min
 AccuracySec=1s
 RandomizedDelaySec=0
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-iplimit.service
 
 [Install]
@@ -1413,10 +1544,10 @@ WantedBy=timers.target
 Description=Run SC 1FORCR auto backup every ${interval} minutes
 
 [Timer]
-OnBootSec=5m
-OnUnitActiveSec=${interval}min
+OnActiveSec=5m
+OnUnitInactiveSec=${interval}min
 AccuracySec=1s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=30s
 Unit=sc-1forcr-autobackup.service
 
@@ -1499,9 +1630,9 @@ WantedBy=timers.target
 Description=Run SC 1FORCR auto reboot every ${interval} minutes
 
 [Timer]
-OnBootSec=${interval}min
-OnUnitActiveSec=${interval}min
-Persistent=true
+OnActiveSec=${interval}min
+OnUnitInactiveSec=${interval}min
+Persistent=false
 AccuracySec=1min
 Unit=sc-1forcr-autoreboot.service
 
@@ -1518,10 +1649,10 @@ function writePullUpdateTimerUnit(settings) {
 Description=Check SC 1FORCR update trigger every ${interval} minutes
 
 [Timer]
-OnBootSec=3m
-OnUnitActiveSec=${interval}min
+OnActiveSec=3m
+OnUnitInactiveSec=${interval}min
 AccuracySec=30s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=30s
 Unit=sc-1forcr-pull-update.service
 
@@ -1538,11 +1669,11 @@ function writeOnlineNotifyTimerUnit(settings) {
 Description=Run SC 1FORCR online account notifier every ${interval} hours
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=${interval}h
+OnActiveSec=10min
+OnUnitInactiveSec=${interval}h
 AccuracySec=1min
 RandomizedDelaySec=0
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-online-notify.service
 
 [Install]
@@ -2362,6 +2493,47 @@ function readCoreApiRuntimeConfig() {
   return { ok: true, token, port };
 }
 
+async function postCoreApi(endpoint, body = {}, timeoutMs = 120000) {
+  const core = readCoreApiRuntimeConfig();
+  if (!core.ok) {
+    return { ok: false, statusCode: 500, message: core.message };
+  }
+  const path = String(endpoint || '').startsWith('/') ? String(endpoint || '') : `/${String(endpoint || '')}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(5000, Number(timeoutMs || 120000)));
+  try {
+    const resp = await fetch(`http://127.0.0.1:${core.port}${path}`, {
+      method: 'POST',
+      headers: {
+        Authorization: core.token,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body || {}),
+      signal: controller.signal
+    });
+    const text = await resp.text();
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch (_) {}
+    if (!resp.ok) {
+      return {
+        ok: false,
+        statusCode: Number(resp.status || 500),
+        message: `core api gagal (${resp.status})`,
+        core_response: parsed || text || null
+      };
+    }
+    return { ok: true, statusCode: Number(resp.status || 200), core_response: parsed || text || null };
+  } catch (err) {
+    return {
+      ok: false,
+      statusCode: 500,
+      message: err?.name === 'AbortError' ? 'request core api timeout' : (err?.message || 'request core api gagal')
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function renewXrayAccount(typeInput, usernameInput, daysInput) {
   const type = String(typeInput || '').trim().toLowerCase();
   const username = String(usernameInput || '').trim();
@@ -2642,6 +2814,29 @@ app.post('/internal/sync-xray-from-db', (req, res) => {
   });
 });
 
+app.post('/internal/restore-finished', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    postCoreApi('/vps/restore-finished', {}, 300000)
+      .then((result) => {
+        if (!result.ok) {
+          return res.status(Number(result.statusCode || 500)).json({
+            ok: false,
+            message: result.message || 'final sync restore gagal',
+            core_response: result.core_response || null
+          });
+        }
+        return res.json({
+          ok: true,
+          core_restore_finished: result.core_response || null
+        });
+      })
+      .catch((err) => {
+        return res.status(500).json({ ok: false, message: err?.message || 'final sync restore gagal' });
+      });
+  });
+});
+
 app.post('/internal/apply-xray-restart', (req, res) => {
   return authorizeAndRun(req, res, (db) => {
     db.close();
@@ -2722,7 +2917,8 @@ app.listen(PORT, HOST, () => {
 });
 JS
 
-  cat > "${APP_DIR}/.env" <<EOF
+  if [[ ! -f "${APP_DIR}/.env" ]]; then
+    cat > "${APP_DIR}/.env" <<EOF
 SUMMARY_PORT=${SUMMARY_PORT}
 SUMMARY_HOST=${SUMMARY_HOST}
 POTATO_DB=${POTATO_DB}
@@ -2741,6 +2937,15 @@ SC_REG_META_FILE=/etc/sc-1forcr-registration.env
 FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
 RESTORE_TMP_DIR=/tmp
 EOF
+  else
+    # Token dan setting runtime dapat diubah oleh admin/bot. Jangan reset saat update.
+    existing_port="$(awk -F= '$1 == "SUMMARY_PORT" {gsub(/[[:space:]\r]/, "", $2); print $2; exit}' "${APP_DIR}/.env" 2>/dev/null || true)"
+    existing_port="$(printf '%s' "${existing_port}" | tr -cd '0-9')"
+    if [[ -n "${existing_port}" && "${existing_port}" -ge 1 && "${existing_port}" -le 65535 ]]; then
+      SUMMARY_PORT="${existing_port}"
+    fi
+    log "Konfigurasi ${APP_DIR}/.env lama dipertahankan."
+  fi
 
   chmod 600 "${APP_DIR}/.env"
 }
@@ -2751,26 +2956,62 @@ install_dependencies() {
     npm init -y >/dev/null 2>&1
   fi
 
-  # sqlite3 prebuilt sering gagal di VPS dengan glibc lama,
-  # jadi paksa build from source agar kompatibel dengan sistem.
-  log "Installing build tools for sqlite3 (source build)..."
-  apt-get update -y
-  apt-get install -y build-essential python3 make g++ gcc libc6-dev pkg-config
+  log "Installing build tools for sqlite3 fallback..."
+  apt_get_safe update -y
+  if ! apt_get_safe install -y \
+    build-essential python3 python3-setuptools python3-packaging \
+    make g++ gcc libc6-dev pkg-config libsqlite3-dev zlib1g-dev \
+    >/tmp/sc-1forcr-summary-build-deps.log 2>&1; then
+    log "Install paket build Summary API gagal. Cek log: /tmp/sc-1forcr-summary-build-deps.log"
+    tail -n 80 /tmp/sc-1forcr-summary-build-deps.log || true
+    exit 1
+  fi
 
-  log "Installing npm dependencies..."
-  # Bersihkan hasil install lama agar sqlite3 binary lama tidak kepakai.
-  rm -rf node_modules package-lock.json
-  npm cache clean --force >/dev/null 2>&1 || true
-
-  npm install express dotenv --omit=dev
-
-  # Paksa compile sqlite3 dari source (jangan ambil prebuilt binary).
-  export npm_config_build_from_source=true
+  export npm_config_build_from_source=false
+  unset npm_config_update_binary
   export npm_config_fallback_to_build=true
-  export npm_config_update_binary=false
-  npm install sqlite3@5.1.7 --unsafe-perm --omit=dev --build-from-source --foreground-scripts --verbose
+  export SETUPTOOLS_USE_DISTUTILS=local
+  npm config set fund false >/dev/null 2>&1 || true
+  npm config set audit false >/dev/null 2>&1 || true
 
-  # Verifikasi binary sqlite3 harus load normal.
+  local node_deps_check="require('sqlite3'); require('express'); require('dotenv');"
+  local need_npm_install="0"
+  if [[ ! -d node_modules ]]; then
+    need_npm_install="1"
+    log "node_modules Summary API belum ada, install dependency..."
+  elif ! node -e "${node_deps_check}" >/dev/null 2>&1; then
+    need_npm_install="1"
+    log "Dependency Summary API rusak/kurang, reinstall dependency..."
+  else
+    log "Dependency Summary API sudah OK."
+  fi
+
+  if [[ "${need_npm_install}" == "1" ]]; then
+    rm -rf node_modules package-lock.json
+    npm cache clean --force >/dev/null 2>&1 || true
+
+    if ! npm install express dotenv sqlite3@5.1.7 --omit=dev --foreground-scripts >/tmp/sc-1forcr-summary-npm-install.log 2>&1; then
+      log "Install npm dependency Summary API gagal. Cek log: /tmp/sc-1forcr-summary-npm-install.log"
+      tail -n 80 /tmp/sc-1forcr-summary-npm-install.log || true
+      exit 1
+    fi
+  fi
+
+  if ! node -e "${node_deps_check}" >/tmp/sc-1forcr-summary-node-check.log 2>&1; then
+    log "sqlite3 Summary API belum bisa diload, coba rebuild native binding..."
+    if ! npm rebuild sqlite3 --build-from-source --foreground-scripts >/tmp/sc-1forcr-summary-npm-rebuild.log 2>&1; then
+      log "Rebuild sqlite3 Summary API gagal. Cek log: /tmp/sc-1forcr-summary-npm-rebuild.log"
+      tail -n 80 /tmp/sc-1forcr-summary-npm-rebuild.log || true
+      exit 1
+    fi
+  fi
+
+  if ! node -e "${node_deps_check}" >/tmp/sc-1forcr-summary-node-check.log 2>&1; then
+    log "Dependency Summary API masih gagal setelah rebuild. Cek log: /tmp/sc-1forcr-summary-node-check.log"
+    cat /tmp/sc-1forcr-summary-node-check.log || true
+    exit 1
+  fi
+
   node -e "require('sqlite3'); console.log('sqlite3 load ok')"
 }
 
@@ -2800,32 +3041,125 @@ open_summary_firewall() {
   fi
 }
 
-start_pm2_service() {
-  cd "${APP_DIR}"
-
-  if [[ "${SUMMARY_UPDATE_SAFE_MODE:-0}" == "1" ]]; then
-    if pm2 describe "${APP_NAME}" >/dev/null 2>&1; then
-      pm2 restart "${APP_NAME}" --update-env >/dev/null 2>&1 || \
-        pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
-    else
-      pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
+summary_health_check() {
+  local attempt port
+  port="$(echo "${SUMMARY_PORT:-8789}" | tr -cd '0-9')"
+  [[ -z "${port}" || "${port}" -lt 1 || "${port}" -gt 65535 ]] && port="8789"
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if systemctl is-active --quiet sc-1forcr-summary-api.service && \
+       curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+      return 0
     fi
-    pm2 save --force >/dev/null 2>&1 || true
-    return 0
-  fi
+    sleep 1
+  done
+  return 1
+}
 
+pm2_daemon_is_running() {
+  local pm2_pid=""
+  [[ -r /root/.pm2/pm2.pid ]] && pm2_pid="$(tr -cd '0-9' </root/.pm2/pm2.pid 2>/dev/null || true)"
+  [[ -n "${pm2_pid}" ]] && kill -0 "${pm2_pid}" >/dev/null 2>&1
+}
+
+pm2_has_other_apps() {
+  local pm2_json
+  command -v pm2 >/dev/null 2>&1 || return 1
+  if ! pm2_json="$(pm2 jlist 2>/dev/null)"; then
+    return 0 # Status tidak pasti: anggap ada aplikasi lain agar PM2 tidak dimatikan.
+  fi
+  printf '%s' "${pm2_json}" | node -e '
+const target = String(process.argv[1] || "tunnel-summary");
+let raw = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { raw += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const apps = JSON.parse(raw || "[]");
+    process.exit(apps.some((app) => String(app && app.name || "") !== target) ? 0 : 1);
+  } catch (_) {
+    process.exit(0); // Jangan matikan PM2 jika statusnya tidak dapat dipastikan.
+  }
+});
+' "${APP_NAME}" >/dev/null 2>&1
+}
+
+restore_pm2_summary_fallback() {
+  command -v pm2 >/dev/null 2>&1 || return 1
+  cd "${APP_DIR}"
   pm2 delete "${APP_NAME}" >/dev/null 2>&1 || true
-  pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M
-  pm2 save --force
+  pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1
+  pm2 save --force >/dev/null 2>&1 || true
+}
 
-  pm2 startup systemd -u root --hp /root >/tmp/pm2-startup.out 2>&1 || true
-  STARTUP_CMD="$(grep -Eo 'sudo .+' /tmp/pm2-startup.out | head -n1 || true)"
-  if [[ -n "${STARTUP_CMD}" ]]; then
-    bash -lc "${STARTUP_CMD#sudo }" || true
+cleanup_old_pm2_summary() {
+  command -v pm2 >/dev/null 2>&1 && pm2_daemon_is_running || return 0
+  pm2 delete "${APP_NAME}" >/dev/null 2>&1 || true
+  pm2 save --force >/dev/null 2>&1 || true
+  if ! pm2_has_other_apps; then
+    pm2 kill >/dev/null 2>&1 || true
+    systemctl disable --now pm2-root.service >/dev/null 2>&1 || true
+    log "PM2 tidak lagi memiliki aplikasi lain; daemon dimatikan (paket tidak dihapus)."
+  else
+    log "PM2 tetap aktif karena masih mengelola aplikasi lain."
+  fi
+}
+
+start_systemd_service() {
+  local unit_tmp had_pm2="0"
+  cd "${APP_DIR}"
+  unit_tmp="$(mktemp /etc/systemd/system/.sc-1forcr-summary-api.XXXXXX)"
+  cat > "${unit_tmp}" <<EOF
+[Unit]
+Description=SC 1FORCR Summary API
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${APP_DIR}/.env
+Environment=NODE_ENV=production
+Environment=UV_THREADPOOL_SIZE=2
+ExecStart=/usr/bin/node ${APP_DIR}/summary-api.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+TasksMax=256
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "${unit_tmp}"
+
+  if command -v pm2 >/dev/null 2>&1 && pm2_daemon_is_running && \
+     pm2 describe "${APP_NAME}" >/dev/null 2>&1; then
+    had_pm2="1"
   fi
 
-  systemctl enable pm2-root >/dev/null 2>&1 || true
-  systemctl restart pm2-root >/dev/null 2>&1 || true
+  # Unit dipasang atomik. PM2 baru dihentikan sesaat sebelum systemd mengambil port.
+  mv -f "${unit_tmp}" /etc/systemd/system/sc-1forcr-summary-api.service
+  systemctl daemon-reload
+  systemctl enable sc-1forcr-summary-api.service >/dev/null 2>&1
+  if [[ "${had_pm2}" == "1" ]]; then
+    pm2 stop "${APP_NAME}" >/dev/null 2>&1 || true
+  fi
+  systemctl restart sc-1forcr-summary-api.service >/dev/null 2>&1 || true
+
+  if ! summary_health_check; then
+    log "Service systemd Summary API gagal health-check; mengembalikan runtime PM2 lama."
+    systemctl disable --now sc-1forcr-summary-api.service >/dev/null 2>&1 || true
+    if [[ "${had_pm2}" == "1" ]] && restore_pm2_summary_fallback; then
+      log "Fallback PM2 berhasil dipulihkan."
+    fi
+    journalctl -u sc-1forcr-summary-api.service -n 80 --no-pager >&2 || true
+    return 1
+  fi
+
+  cleanup_old_pm2_summary
+  log "Summary API aktif via systemd; PM2 tidak lagi diperlukan untuk service ini."
 }
 
 install_summary_watchdog() {
@@ -2840,6 +3174,7 @@ install_summary_watchdog() {
 set -euo pipefail
 APP_NAME="${app_name}"
 APP_DIR="${app_dir}"
+SERVICE_NAME="sc-1forcr-summary-api.service"
 PORT="${port}"
 LOG_TAG="sc-1forcr-summary-watchdog"
 
@@ -2851,12 +3186,8 @@ if curl -fsS --connect-timeout 2 --max-time 6 "http://127.0.0.1:\${PORT}/health"
   exit 0
 fi
 
-log_msg "summary api health gagal, restart pm2 \${APP_NAME}"
-if command -v pm2 >/dev/null 2>&1; then
-  pm2 restart "\${APP_NAME}" --update-env >/dev/null 2>&1 || \
-    pm2 start "\${APP_DIR}/summary-api.js" --name "\${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
-  pm2 save --force >/dev/null 2>&1 || true
-fi
+log_msg "summary api health gagal, restart systemd \${SERVICE_NAME}"
+systemctl restart "\${SERVICE_NAME}" >/dev/null 2>&1 || true
 
 sleep 3
 if ! curl -fsS --connect-timeout 2 --max-time 6 "http://127.0.0.1:\${PORT}/health" >/dev/null 2>&1; then
@@ -2871,7 +3202,7 @@ EOF
   cat > /etc/systemd/system/sc-1forcr-summary-watchdog.service <<'EOF'
 [Unit]
 Description=SC 1FORCR Summary API watchdog
-After=network-online.target pm2-root.service
+After=network-online.target sc-1forcr-summary-api.service
 
 [Service]
 Type=oneshot
@@ -2883,8 +3214,8 @@ EOF
 Description=Run SC 1FORCR Summary API watchdog
 
 [Timer]
-OnBootSec=2m
-OnUnitActiveSec=2m
+OnActiveSec=2m
+OnUnitInactiveSec=2m
 AccuracySec=30s
 Unit=sc-1forcr-summary-watchdog.service
 
@@ -2900,7 +3231,7 @@ EOF
 print_result() {
   log "Done."
   echo
-  echo "Service Name : ${APP_NAME}"
+  echo "Service Name : sc-1forcr-summary-api.service (systemd)"
   echo "Service Path : ${APP_DIR}/summary-api.js"
   echo "Listen       : ${SUMMARY_HOST}:${SUMMARY_PORT}"
   echo "DB Path      : ${POTATO_DB}"
@@ -2945,12 +3276,47 @@ print_result() {
   echo "    \"http://127.0.0.1:${SUMMARY_PORT}/internal/restore-full-backup-url\" && echo"
 }
 
+SUMMARY_TRANSACTION_SNAPSHOT=""
+SUMMARY_TRANSACTION_COMMITTED="0"
+
+rollback_summary_transaction_on_exit() {
+  local rc="$?"
+  trap - EXIT
+  if [[ "${SUMMARY_TRANSACTION_COMMITTED:-0}" != "1" && -n "${SUMMARY_TRANSACTION_SNAPSHOT:-}" && \
+        -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
+    log "Update Summary API gagal; menjalankan rollback otomatis."
+    /usr/local/sbin/sc-1forcr-update-manager rollback "${SUMMARY_TRANSACTION_SNAPSHOT}" || \
+      log "PERINGATAN: rollback otomatis gagal. Snapshot: ${SUMMARY_TRANSACTION_SNAPSHOT}"
+  fi
+  exit "${rc}"
+}
+
+begin_summary_transaction() {
+  [[ "${SUMMARY_UPDATE_SAFE_MODE:-0}" == "1" ]] || return 0
+  if [[ ! -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
+    log "Update aman membutuhkan sc-1forcr-update-manager terbaru. Update SC utama terlebih dahulu."
+    return 1
+  fi
+  SUMMARY_TRANSACTION_SNAPSHOT="$(SC_UPDATE_SNAPSHOT_INCLUDE_DB=0 \
+    /usr/local/sbin/sc-1forcr-update-manager snapshot 'pre-summary-systemd-migration')"
+  /usr/local/sbin/sc-1forcr-update-manager verify "${SUMMARY_TRANSACTION_SNAPSHOT}" >/dev/null
+  trap rollback_summary_transaction_on_exit EXIT
+}
+
+commit_summary_transaction() {
+  [[ -n "${SUMMARY_TRANSACTION_SNAPSHOT:-}" ]] || return 0
+  /usr/local/sbin/sc-1forcr-update-manager commit "${SUMMARY_TRANSACTION_SNAPSHOT}" "summary-systemd"
+  SUMMARY_TRANSACTION_COMMITTED="1"
+  trap - EXIT
+}
+
 install_node_if_missing
-install_pm2_if_missing
 install_vnstat_if_missing
+begin_summary_transaction
 write_files
 install_dependencies
-start_pm2_service
+start_systemd_service
 install_summary_watchdog
 open_summary_firewall
+commit_summary_transaction
 print_result
